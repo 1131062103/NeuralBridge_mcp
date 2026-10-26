@@ -46,7 +46,7 @@ object McpToolRegistry {
         ),
         McpToolDefinition(
             name = "android_find_elements",
-            description = "Find UI elements by text, resource_id, content_desc, or class_name. Prefer resource_id for stability. Set find_all=true for all matches. Returns bounds.",
+            description = "Find UI elements by text, resource_id, content_desc, or class_name. Prefer resource_id for stability. Set find_all=true for all matches. Returns elementId, className, editable, focusable, enabled, visible and bounds.",
             inputSchema = buildJsonObject {
                 put("type", "object")
                 putJsonObject("properties") {
@@ -57,9 +57,17 @@ object McpToolRegistry {
                     putJsonObject("clickable") { put("type", "boolean"); put("description", "Filter clickable") }
                     putJsonObject("scrollable") { put("type", "boolean"); put("description", "Filter scrollable") }
                     putJsonObject("focusable") { put("type", "boolean"); put("description", "Filter focusable") }
+                    putJsonObject("editable") { put("type", "boolean"); put("description", "Only return editable nodes") }
+                    putJsonObject("visible") { put("type", "boolean"); put("description", "Only return visible nodes (default true; false includes invisible)") }
+                    putJsonObject("prefer_editable") { put("type", "boolean"); put("description", "Sort editable/visible/focusable/smaller elements first (default true)") }
                     putJsonObject("find_all") { put("type", "boolean"); put("description", "Return all matches") }
                 }
             }
+        ),
+        McpToolDefinition(
+            name = "android_get_focused_element",
+            description = "Get the currently focused input element (read-only). Returns elementId, resourceId, className, text, hint, editable, bounds and package; password text is masked as \"***\". Useful before input_text or when press_key reports no focused field.",
+            inputSchema = buildJsonObject { put("type", "object"); putJsonObject("properties") {} }
         ),
         McpToolDefinition(
             name = "android_get_screen_context",
@@ -205,14 +213,29 @@ object McpToolRegistry {
         ),
         McpToolDefinition(
             name = "android_input_text",
-            description = "Type text into input field by element_text or resource_id. Omit selector for focused field. Set append=true to add text.",
+            description = "Type text into an input field. Target priority: element_id > resource_id > bounds (+class_name) > element_text > focused editable field. Uses ACTION_SET_TEXT, optionally falls back to clipboard, and reads back before/after. Works with custom EditTexts that have no resource_id.",
             inputSchema = buildJsonObject {
                 put("type", "object")
                 putJsonObject("properties") {
                     putJsonObject("text") { put("type", "string"); put("description", "Text to input") }
                     putJsonObject("element_text") { put("type", "string"); put("description", "Input field text/hint") }
                     putJsonObject("resource_id") { put("type", "string"); put("description", "Input field resource ID") }
+                    putJsonObject("element_id") {
+                        put("type", "string")
+                        put("description", "elementId returned by find_elements/get_ui_tree (16 hex chars)")
+                    }
+                    putJsonObject("bounds") {
+                        putJsonArray("type") { add(JsonPrimitive("string")); add(JsonPrimitive("object")) }
+                        put("description", "Target bounds: \"[left,top][right,bottom]\", \"[left,top,right,bottom]\" or {left,top,right,bottom}")
+                    }
+                    putJsonObject("class_name") {
+                        put("type", "string")
+                        put("description", "Optional class-name filter for bounds matching (contains, e.g. EditText)")
+                    }
                     putJsonObject("append") { put("type", "boolean"); put("description", "Append to existing text") }
+                    putJsonObject("read_back") { put("type", "boolean"); put("description", "Read the target text back after input (default true)") }
+                    putJsonObject("allow_clipboard") { put("type", "boolean"); put("description", "Allow clipboard fallback when ACTION_SET_TEXT fails (default true)") }
+                    putJsonObject("bounds_tolerance") { put("type", "integer"); put("description", "Allowed per-edge bounds drift in px (default 2)") }
                 }
                 putJsonArray("required") { add(JsonPrimitive("text")) }
             }

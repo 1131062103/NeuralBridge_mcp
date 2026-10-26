@@ -617,6 +617,7 @@ data class UiElement(
     val longClickable: Boolean,
     val checkable: Boolean,
     val checked: Boolean,
+    val editable: Boolean = false,
     val semanticType: String,
     val aiDescription: String
 )

@@ -2,17 +2,25 @@ package com.neuralbridge.companion.mcp
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
 import android.util.Base64
 import android.util.Log
+import android.view.accessibility.AccessibilityNodeInfo
 import com.neuralbridge.companion.gesture.GestureEngine
 import com.neuralbridge.companion.input.InputEngine
+import com.neuralbridge.companion.input.InputTargeting
+import com.neuralbridge.companion.input.InputTargeting.area
+import com.neuralbridge.companion.input.InputTargeting.formatBounds
+import com.neuralbridge.companion.input.InputTargeting.matches
+import com.neuralbridge.companion.input.InputTargeting.textMatches
 import com.neuralbridge.companion.notification.NotificationListener
 import com.neuralbridge.companion.screenshot.ScreenshotPipeline
 import com.neuralbridge.companion.service.AccessibilityEventListener
 import com.neuralbridge.companion.service.GestureResultCallback
 import com.neuralbridge.companion.service.NeuralBridgeAccessibilityService
+import com.neuralbridge.companion.service.Bounds
 import com.neuralbridge.companion.service.ScreenshotQuality
 import com.neuralbridge.companion.service.UiElement
 import com.neuralbridge.companion.service.UiTree
@@ -33,6 +41,7 @@ class McpToolHandler(
         private const val TAG = "McpToolHandler"
         private const val DEFAULT_TIMEOUT_MS = 10000L
         private const val POLL_INTERVAL_MS = 300L
+        private const val MAX_RECURSION_DEPTH = 50
     }
 
     suspend fun handleToolCall(toolName: String, arguments: JsonObject?): McpToolCallResult {
@@ -43,6 +52,7 @@ class McpToolHandler(
                 "android_get_ui_tree" -> handleGetUiTree(args)
                 "android_screenshot" -> handleScreenshot(args)
                 "android_find_elements" -> handleFindElements(args)
+                "android_get_focused_element" -> handleGetFocusedElement()
                 "android_get_screen_context" -> handleGetScreenContext(args)
                 "android_get_notifications" -> handleGetNotifications(args)
                 "android_accessibility_audit" -> handleAccessibilityAudit(args)
@@ -193,31 +203,52 @@ class McpToolHandler(
         val contentDesc = args["content_desc"]?.jsonPrimitive?.contentOrNull
         val className = args["class_name"]?.jsonPrimitive?.contentOrNull
         val findAll = args["find_all"]?.jsonPrimitive?.booleanOrNull ?: false
+        val editableOnly = args["editable"]?.jsonPrimitive?.booleanOrNull ?: false
+        val visibleOnly = args["visible"]?.jsonPrimitive?.booleanOrNull ?: true
+        val preferEditable = args["prefer_editable"]?.jsonPrimitive?.booleanOrNull ?: true
 
         if (text == null && resourceId == null && contentDesc == null && className == null) {
             return errorResult("At least one selector (text, resource_id, content_desc, class_name) required")
         }
 
         val rootNode = service.rootInActiveWindow ?: return errorResult("No active window")
-        val tree = uiTreeWalker.walkTree(rootNode)
+        val tree = uiTreeWalker.walkTree(rootNode, includeInvisible = !visibleOnly)
 
-        val matches = tree.elements.filter { e ->
+        var matches = tree.elements.filter { e ->
             (text != null && e.text?.contains(text, ignoreCase = true) == true) ||
             (resourceId != null && (e.resourceId?.endsWith(resourceId) == true)) ||
             (contentDesc != null && e.contentDescription?.contains(contentDesc, ignoreCase = true) == true) ||
             (className != null && e.className?.contains(className) == true)
-        }.let { if (findAll) it else if (it.isNotEmpty()) listOf(it.first()) else it }
+        }.filter { e ->
+            (!editableOnly || e.editable) && (!visibleOnly || e.visible)
+        }
+
+        if (preferEditable) {
+            matches = matches.sortedWith(
+                compareBy<UiElement> { if (it.editable) 0 else 1 }
+                    .thenBy { if (it.visible) 0 else 1 }
+                    .thenBy { if (it.focusable) 0 else 1 }
+                    .thenBy { it.bounds?.area() ?: Long.MAX_VALUE }
+            )
+        }
+
+        val returned = if (findAll) matches else matches.take(1)
 
         val result = buildJsonObject {
             putJsonArray("elements") {
-                matches.forEach { e ->
+                returned.forEach { e ->
                     addJsonObject {
                         put("elementId", e.elementId)
-                        e.resourceId?.let { put("resourceId", it) }
-                        e.text?.let { put("text", it) }
-                        e.contentDescription?.let { put("contentDescription", it) }
-                        e.bounds?.let { b -> put("bounds", "[${b.left},${b.top},${b.right},${b.bottom}]") }
+                        put("resourceId", e.resourceId?.let { JsonPrimitive(it) } ?: JsonNull)
+                        put("className", e.className?.let { JsonPrimitive(it) } ?: JsonNull)
+                        put("text", e.text?.let { JsonPrimitive(it) } ?: JsonNull)
+                        put("contentDescription", e.contentDescription?.let { JsonPrimitive(it) } ?: JsonNull)
+                        put("bounds", e.bounds?.let { JsonPrimitive(formatBounds(it)) } ?: JsonNull)
                         put("clickable", e.clickable)
+                        put("editable", e.editable)
+                        put("focusable", e.focusable)
+                        put("enabled", e.enabled)
+                        put("visible", e.visible)
                     }
                 }
             }
@@ -493,53 +524,608 @@ class McpToolHandler(
     }
 
     private suspend fun handleInputText(args: JsonObject): McpToolCallResult {
+        val startedAt = System.currentTimeMillis()
         val text = args["text"]?.jsonPrimitive?.contentOrNull ?: return errorResult("text required")
         val append = args["append"]?.jsonPrimitive?.booleanOrNull ?: false
-        val resourceId = args["resource_id"]?.jsonPrimitive?.contentOrNull
-        val elementText = args["element_text"]?.jsonPrimitive?.contentOrNull
+        val readBack = args["read_back"]?.jsonPrimitive?.booleanOrNull ?: true
+        val allowClipboard = args["allow_clipboard"]?.jsonPrimitive?.booleanOrNull ?: true
+        val tolerance = (args["bounds_tolerance"]?.jsonPrimitive?.intOrNull ?: 2).coerceAtLeast(0)
+
+        val elementId = args["element_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        val resourceId = args["resource_id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        val elementText = args["element_text"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+        val className = args["class_name"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+
+        val boundsArg = args["bounds"]
+        val bounds = if (boundsArg == null || boundsArg is JsonNull) {
+            null
+        } else {
+            InputTargeting.parseBounds(boundsArg)
+                ?: return inputFailure(
+                    "INVALID_BOUNDS",
+                    "bounds must be \"[l,t][r,b]\", \"[l,t,r,b]\" or {left,top,right,bottom}"
+                )
+        }
 
         val rootNode = service.rootInActiveWindow ?: return errorResult("No active window")
         val tree = uiTreeWalker.walkTree(rootNode)
+        val spec = TargetSpec(elementId, resourceId, bounds, className, elementText, tolerance)
 
-        val target = if (resourceId != null || elementText != null) {
-            resolveSelector(tree, elementText, resourceId, null)
-                ?: return errorResult("Element not found: resource_id=$resourceId, text=$elementText")
-        } else {
-            tree.elements.firstOrNull { e ->
-                e.focusable && (
-                    e.className?.contains("EditText") == true ||
+        when (val resolution = resolveTarget(rootNode, tree, spec)) {
+            is TargetResolution.Failure ->
+                return inputFailure(resolution.code, resolution.message, resolution.target)
+
+            is TargetResolution.Found -> {
+                val node = resolution.node
+                try {
+                    val target = snapshotTarget(node, resolution.element)
+                    val before = readNodeText(node)
+
+                    val method = when {
+                        inputEngine.trySetText(node, text, append) -> "action_set_text"
+                        allowClipboard && inputEngine.tryClipboard(node, text, append) -> "clipboard"
+                        else -> return inputFailure(
+                            "INPUT_REJECTED",
+                            if (allowClipboard) {
+                                "ACTION_SET_TEXT and clipboard fallback both failed"
+                            } else {
+                                "ACTION_SET_TEXT rejected and clipboard fallback is disabled"
+                            },
+                            target
+                        )
+                    }
+
+                    var after = before
+                    if (readBack) {
+                        var verified = false
+                        for (attempt in 0 until 3) {
+                            if (attempt > 0) delay(50L)
+                            refreshNode(node)
+                            after = readNodeText(node)
+                            if (textMatches(after, text, append, before)) {
+                                verified = true
+                                break
+                            }
+                        }
+                        if (!verified) {
+                            return inputFailure(
+                                "INPUT_VERIFY_FAILED",
+                                "operation reported success but read-back did not match the requested text",
+                                target,
+                                before,
+                                after
+                            )
+                        }
+                    } else {
+                        refreshNode(node)
+                        after = readNodeText(node)
+                    }
+
+                    val payload = buildJsonObject {
+                        put("success", true)
+                        put("method", method)
+                        putTarget(target)
+                        put("before", before)
+                        put("after", after)
+                        put("latency_ms", System.currentTimeMillis() - startedAt)
+                    }
+                    return textResult(payload.toString())
+                } finally {
+                    recycle(node)
+                }
+            }
+        }
+    }
+
+    private data class TargetSpec(
+        val elementId: String? = null,
+        val resourceId: String? = null,
+        val bounds: Bounds? = null,
+        val className: String? = null,
+        val text: String? = null,
+        val tolerance: Int = 2
+    )
+
+    private sealed class TargetResolution {
+        data class Found(
+            val element: UiElement?,
+            val node: AccessibilityNodeInfo
+        ) : TargetResolution()
+
+        data class Failure(
+            val code: String,
+            val message: String,
+            val target: TargetSnapshot? = null
+        ) : TargetResolution()
+    }
+
+    private data class TargetSnapshot(
+        val elementId: String?,
+        val resourceId: String?,
+        val className: String?,
+        val editable: Boolean,
+        val bounds: String?
+    )
+
+    private data class ElementSelection(
+        val element: UiElement?,
+        val ambiguous: Boolean = false
+    )
+
+    private data class NodeLookup(
+        val node: AccessibilityNodeInfo? = null,
+        val ambiguous: Boolean = false
+    )
+
+    /**
+     * element_id > resource_id > bounds (+ class_name) > element_text > focused editable.
+     * The first supplied selector is authoritative: stale bounds must fail instead of
+     * silently typing into a different field.
+     */
+    private fun resolveTarget(
+        root: AccessibilityNodeInfo,
+        tree: UiTree,
+        spec: TargetSpec
+    ): TargetResolution {
+        spec.elementId?.let { elementId ->
+            val candidates = tree.elements.filter { it.elementId == elementId }
+            if (candidates.isEmpty()) {
+                return TargetResolution.Failure(
+                    "TARGET_NOT_FOUND",
+                    "No element with elementId=$elementId"
+                )
+            }
+            val selection = selectElement(candidates, detectAmbiguity = true)
+            if (selection.ambiguous) {
+                return TargetResolution.Failure(
+                    "TARGET_AMBIGUOUS",
+                    "Multiple elements share elementId=$elementId; target by bounds instead",
+                    selection.element?.toSnapshot()
+                )
+            }
+            return resolveNodeForElement(root, selection.element!!, spec.tolerance)
+        }
+
+        spec.resourceId?.let { resourceId ->
+            val candidates = tree.elements.filter { it.resourceId?.endsWith(resourceId) == true }
+            if (candidates.isEmpty()) {
+                return TargetResolution.Failure(
+                    "TARGET_NOT_FOUND",
+                    "No element with resource_id=$resourceId"
+                )
+            }
+            val element = selectElement(candidates, detectAmbiguity = false).element!!
+            return resolveNodeForElement(root, element, spec.tolerance)
+        }
+
+        spec.bounds?.let { bounds ->
+            val candidates = tree.elements.filter { e ->
+                e.bounds?.matches(bounds, spec.tolerance) == true &&
+                    (spec.className == null || e.className?.contains(spec.className) == true)
+            }
+            if (candidates.isEmpty()) {
+                return TargetResolution.Failure(
+                    "TARGET_NOT_FOUND",
+                    "No element matched the supplied bounds/class_name (stale bounds?)"
+                )
+            }
+            val selection = selectElement(candidates, detectAmbiguity = true)
+            if (selection.ambiguous) {
+                return TargetResolution.Failure(
+                    "TARGET_AMBIGUOUS",
+                    "Multiple nodes share these bounds; add class_name or use element_id",
+                    selection.element?.toSnapshot()
+                )
+            }
+            return resolveNodeForElement(root, selection.element!!, spec.tolerance)
+        }
+
+        spec.text?.let { text ->
+            val element = tree.elements.firstOrNull {
+                it.text?.contains(text, ignoreCase = true) == true
+            } ?: return TargetResolution.Failure(
+                "TARGET_NOT_FOUND",
+                "No element with text=$text"
+            )
+            return resolveNodeForElement(root, element, spec.tolerance)
+        }
+
+        return resolveFocusedOrLegacy(root, tree, spec.tolerance)
+    }
+
+    private fun resolveFocusedOrLegacy(
+        root: AccessibilityNodeInfo,
+        tree: UiTree,
+        tolerance: Int
+    ): TargetResolution {
+        val focused = try {
+            root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        } catch (e: Exception) {
+            null
+        }
+
+        if (focused != null) {
+            val element = matchElementForNode(tree, focused)
+            val editable = findEditableNode(focused)
+            if (editable == null) {
+                val target = snapshotTarget(focused, element)
+                recycle(focused)
+                return TargetResolution.Failure(
+                    "INPUT_NOT_EDITABLE",
+                    "Focused node is not editable",
+                    target
+                )
+            }
+            if (editable !== focused) recycle(focused)
+            refreshNode(editable)
+            return TargetResolution.Found(element, editable)
+        }
+
+        // Legacy no-selector behavior: first focusable input-like element.
+        val legacy = tree.elements.firstOrNull { e ->
+            e.focusable && (
+                e.className?.contains("EditText") == true ||
                     e.className?.contains("TextField") == true ||
                     e.className == "android.widget.AutoCompleteTextView" ||
                     e.className?.contains("SearchView") == true
                 )
-            }
-                ?: return errorResult("No editable element found. Specify resource_id or element_text")
+        } ?: tree.elements.firstOrNull { it.editable }
+
+        if (legacy == null) {
+            return TargetResolution.Failure(
+                "TARGET_NOT_FOUND",
+                "No focused editable element found. Specify element_id, resource_id, bounds or element_text."
+            )
         }
-
-        // Walk node tree to find matching AccessibilityNodeInfo by resource ID or text
-        val nodeInfo = findNodeByElement(rootNode, target.resourceId, target.text)
-            ?: return errorResult("Could not get node reference for element")
-
-        val success = inputEngine.inputText(nodeInfo, text, append)
-        @Suppress("DEPRECATION")
-        nodeInfo.recycle()
-        return if (success) textResult("{\"latency_ms\":0}") else errorResult("Input text failed")
+        return resolveNodeForElement(root, legacy, tolerance)
     }
 
-    private fun findNodeByElement(
-        root: android.view.accessibility.AccessibilityNodeInfo,
-        resourceId: String?,
-        text: String?
-    ): android.view.accessibility.AccessibilityNodeInfo? {
-        if (resourceId != null) {
-            val results = root.findAccessibilityNodeInfosByViewId(resourceId)
-            if (results.isNotEmpty()) return results.first()
+    private fun resolveNodeForElement(
+        root: AccessibilityNodeInfo,
+        element: UiElement,
+        tolerance: Int
+    ): TargetResolution {
+        val lookup = findNodeForElement(root, element, tolerance)
+        if (lookup.ambiguous) {
+            return TargetResolution.Failure(
+                "TARGET_AMBIGUOUS",
+                "Multiple nodes match this target; add class_name or use element_id",
+                element.toSnapshot()
+            )
         }
-        if (text != null) {
-            val results = root.findAccessibilityNodeInfosByText(text)
-            if (results.isNotEmpty()) return results.first()
+
+        val node = lookup.node ?: return TargetResolution.Failure(
+            "TARGET_NOT_FOUND",
+            "Element is no longer present on screen (stale bounds?)",
+            element.toSnapshot()
+        )
+
+        val editable = findEditableNode(node)
+        if (editable == null) {
+            val target = snapshotTarget(node, element)
+            recycle(node)
+            return TargetResolution.Failure(
+                "INPUT_NOT_EDITABLE",
+                "matched a non-editable wrapper; no editable descendant found",
+                target
+            )
+        }
+        if (editable !== node) recycle(node)
+        refreshNode(editable)
+        return TargetResolution.Found(element, editable)
+    }
+
+    private fun selectElement(
+        candidates: List<UiElement>,
+        detectAmbiguity: Boolean
+    ): ElementSelection {
+        if (candidates.isEmpty()) return ElementSelection(null)
+        val comparator = compareBy<UiElement>(
+            { if (it.editable) 0 else 1 },
+            { if (it.visible) 0 else 1 },
+            { if (it.focusable) 0 else 1 },
+            { it.bounds?.area() ?: Long.MAX_VALUE }
+        )
+        val sorted = candidates.sortedWith(comparator)
+        val best = sorted.first()
+        val ambiguous = detectAmbiguity &&
+            sorted.size > 1 &&
+            comparator.compare(best, sorted[1]) == 0
+        return ElementSelection(best, ambiguous)
+    }
+
+    /**
+     * Locate the real node for a UiElement: resourceId first, then a recursive
+     * bounds+className scan. Prefer editable, visible, focusable, then smaller area.
+     */
+    private fun findNodeForElement(
+        root: AccessibilityNodeInfo,
+        element: UiElement,
+        tolerance: Int
+    ): NodeLookup {
+        val bounds = element.bounds ?: return NodeLookup()
+        val className = element.className
+        val candidates = mutableListOf<AccessibilityNodeInfo>()
+
+        element.resourceId?.let { viewId ->
+            val results = try {
+                root.findAccessibilityNodeInfosByViewId(viewId)
+            } catch (e: Exception) {
+                emptyList()
+            }
+            results.forEach { node ->
+                if (nodeMatches(node, bounds, className, tolerance)) {
+                    candidates.add(node)
+                } else {
+                    recycle(node)
+                }
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            collectNodesByBounds(root, bounds, className, tolerance, 0, candidates)
+        }
+
+        if (candidates.isEmpty()) return NodeLookup()
+
+        val comparator = compareBy<AccessibilityNodeInfo>(
+            { if (it.isEditable) 0 else 1 },
+            { if (it.isVisibleToUser) 0 else 1 },
+            { if (it.isFocusable) 0 else 1 },
+            { nodeArea(it) }
+        )
+        val sorted = candidates.sortedWith(comparator)
+        val best = sorted.first()
+
+        if (sorted.size > 1 && comparator.compare(best, sorted[1]) == 0) {
+            candidates.forEach { recycle(it) }
+            return NodeLookup(ambiguous = true)
+        }
+
+        candidates.forEach { if (it !== best) recycle(it) }
+        return NodeLookup(node = best)
+    }
+
+    private fun collectNodesByBounds(
+        node: AccessibilityNodeInfo,
+        bounds: Bounds,
+        className: String?,
+        tolerance: Int,
+        depth: Int,
+        out: MutableList<AccessibilityNodeInfo>
+    ) {
+        if (depth > MAX_RECURSION_DEPTH) return
+
+        if (nodeMatches(node, bounds, className, tolerance)) {
+            @Suppress("DEPRECATION")
+            out.add(AccessibilityNodeInfo.obtain(node))
+        }
+
+        val childCount = try {
+            node.childCount
+        } catch (e: Exception) {
+            0
+        }
+        for (i in 0 until childCount) {
+            val child = try {
+                node.getChild(i)
+            } catch (e: Exception) {
+                null
+            } ?: continue
+            try {
+                collectNodesByBounds(child, bounds, className, tolerance, depth + 1, out)
+            } finally {
+                recycle(child)
+            }
+        }
+    }
+
+    private fun nodeMatches(
+        node: AccessibilityNodeInfo,
+        bounds: Bounds,
+        className: String?,
+        tolerance: Int
+    ): Boolean {
+        if (className != null && node.className?.toString() != className) return false
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        return Bounds(rect.left, rect.top, rect.right, rect.bottom).matches(bounds, tolerance)
+    }
+
+    private fun findEditableNode(
+        node: AccessibilityNodeInfo,
+        depth: Int = 0
+    ): AccessibilityNodeInfo? {
+        if (depth > MAX_RECURSION_DEPTH) return null
+        if (node.isEditable) return node
+
+        val childCount = try {
+            node.childCount
+        } catch (e: Exception) {
+            0
+        }
+        for (i in 0 until childCount) {
+            val child = try {
+                node.getChild(i)
+            } catch (e: Exception) {
+                null
+            } ?: continue
+            val found = findEditableNode(child, depth + 1)
+            if (found != null) {
+                if (found !== child) recycle(child)
+                return found
+            }
+            recycle(child)
         }
         return null
+    }
+
+    private fun matchElementForNode(tree: UiTree, node: AccessibilityNodeInfo): UiElement? {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        val bounds = Bounds(rect.left, rect.top, rect.right, rect.bottom)
+        val className = node.className?.toString()
+        val resourceId = node.viewIdResourceName
+        val text = node.text?.toString()
+
+        return tree.elements.firstOrNull { e ->
+            e.bounds?.matches(bounds, 0) == true &&
+                e.className == className &&
+                (resourceId == null || e.resourceId == resourceId)
+        } ?: tree.elements.firstOrNull { e ->
+            resourceId != null && e.resourceId == resourceId
+        } ?: tree.elements.firstOrNull { e ->
+            e.bounds?.matches(bounds, 0) == true && e.text == text
+        }
+    }
+
+    private fun snapshotTarget(
+        node: AccessibilityNodeInfo,
+        element: UiElement?
+    ): TargetSnapshot {
+        val rect = Rect()
+        try {
+            node.getBoundsInScreen(rect)
+        } catch (e: Exception) {
+            // Keep zeros; fall back to the UiElement bounds below.
+        }
+
+        val outputBounds = if (rect.right > rect.left && rect.bottom > rect.top) {
+            formatBounds(Bounds(rect.left, rect.top, rect.right, rect.bottom))
+        } else {
+            element?.bounds?.let { formatBounds(it) }
+        }
+
+        return TargetSnapshot(
+            elementId = try {
+                element?.elementId ?: uiTreeWalker.elementIdFor(node)
+            } catch (e: Exception) {
+                element?.elementId
+            },
+            resourceId = node.viewIdResourceName?.takeIf { it.isNotEmpty() } ?: element?.resourceId,
+            className = node.className?.toString()?.takeIf { it.isNotEmpty() } ?: element?.className,
+            editable = try {
+                node.isEditable
+            } catch (e: Exception) {
+                element?.editable ?: false
+            },
+            bounds = outputBounds
+        )
+    }
+
+    private fun UiElement.toSnapshot(): TargetSnapshot = TargetSnapshot(
+        elementId = elementId,
+        resourceId = resourceId,
+        className = className,
+        editable = editable,
+        bounds = bounds?.let { formatBounds(it) }
+    )
+
+    private fun inputFailure(
+        code: String,
+        message: String,
+        target: TargetSnapshot? = null,
+        before: String? = null,
+        after: String? = null
+    ): McpToolCallResult {
+        val payload = buildJsonObject {
+            put("success", false)
+            put("error_code", code)
+            put("message", message)
+            if (target != null) putTarget(target)
+            if (before != null) put("before", before)
+            if (after != null) put("after", after)
+        }
+        return errorResult(payload.toString())
+    }
+
+    private fun JsonObjectBuilder.putTarget(target: TargetSnapshot) {
+        putJsonObject("target") {
+            put("elementId", target.elementId?.let { JsonPrimitive(it) } ?: JsonNull)
+            put("resourceId", target.resourceId?.let { JsonPrimitive(it) } ?: JsonNull)
+            put("className", target.className?.let { JsonPrimitive(it) } ?: JsonNull)
+            put("editable", target.editable)
+            put("bounds", target.bounds?.let { JsonPrimitive(it) } ?: JsonNull)
+        }
+    }
+
+    private fun readNodeText(node: AccessibilityNodeInfo): String = try {
+        node.text?.toString().orEmpty()
+    } catch (e: Exception) {
+        ""
+    }
+
+    private fun refreshNode(node: AccessibilityNodeInfo) {
+        try {
+            node.refresh()
+        } catch (e: Exception) {
+            // Node may be stale after the input operation; readNodeText handles that.
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun recycle(node: AccessibilityNodeInfo?) {
+        if (node == null) return
+        try {
+            node.recycle()
+        } catch (e: Exception) {
+            // Already recycled / not owned by us; nothing to do.
+        }
+    }
+
+    private fun nodeArea(node: AccessibilityNodeInfo): Long {
+        val rect = Rect()
+        try {
+            node.getBoundsInScreen(rect)
+        } catch (e: Exception) {
+            return Long.MAX_VALUE
+        }
+        val width = (rect.right - rect.left).coerceAtLeast(0).toLong()
+        val height = (rect.bottom - rect.top).coerceAtLeast(0).toLong()
+        return width * height
+    }
+
+    private suspend fun handleGetFocusedElement(): McpToolCallResult {
+        val rootNode = service.rootInActiveWindow ?: return errorResult("No active window")
+        val focused = try {
+            rootNode.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        } catch (e: Exception) {
+            null
+        } ?: return textResult("{\"focused\":false}")
+
+        return try {
+            val tree = uiTreeWalker.walkTree(rootNode)
+            val element = matchElementForNode(tree, focused)
+            val rect = Rect()
+            focused.getBoundsInScreen(rect)
+            val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                focused.hintText?.toString()
+            } else {
+                null
+            }
+
+            val payload = buildJsonObject {
+                put("focused", true)
+                put(
+                    "elementId",
+                    (element?.elementId ?: uiTreeWalker.elementIdFor(focused)).let { JsonPrimitive(it) }
+                )
+                put("resourceId", focused.viewIdResourceName?.let { JsonPrimitive(it) } ?: JsonNull)
+                put("className", focused.className?.toString()?.let { JsonPrimitive(it) } ?: JsonNull)
+                put(
+                    "text",
+                    InputTargeting.maskedText(focused.text?.toString(), focused.isPassword)
+                        ?.let { JsonPrimitive(it) } ?: JsonNull
+                )
+                put("hint", hint?.let { JsonPrimitive(it) } ?: JsonNull)
+                put("editable", focused.isEditable)
+                put("bounds", formatBounds(Bounds(rect.left, rect.top, rect.right, rect.bottom)))
+                put("package", focused.packageName?.toString()?.let { JsonPrimitive(it) } ?: JsonNull)
+            }
+            textResult(payload.toString())
+        } finally {
+            recycle(focused)
+        }
     }
 
     private fun handlePressKey(args: JsonObject): McpToolCallResult {

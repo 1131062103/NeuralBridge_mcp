@@ -49,38 +49,78 @@ class InputEngine(
             return false
         }
 
+        if (!element.isEditable) {
+            Log.w(TAG, "Element is not editable, refusing text input")
+            return false
+        }
+
         if (!element.isFocused) {
             element.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             element.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         }
-        if (!element.isEditable) {
-            Log.w(TAG, "Element is not marked editable, attempting input anyway")
-        }
 
         Log.d(TAG, "Inputting text: ${text.length} chars, append=$append")
 
-        // Strategy 1: Try accessibility ACTION_SET_TEXT
-        if (element.isAccessibilityFocused || element.performAction(AccessibilityNodeInfo.ACTION_FOCUS)) {
-            val arguments = Bundle().apply {
-                putCharSequence(
-                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                    if (append && element.text != null) {
-                        "${element.text}$text"
-                    } else {
-                        text
-                    }
-                )
-            }
+        // Strategy 1: ACTION_SET_TEXT, strategy 2: clipboard paste fallback
+        return trySetText(element, text, append) || tryClipboard(element, text, append)
+    }
 
-            if (element.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)) {
-                Log.d(TAG, "Text set via ACTION_SET_TEXT")
-                return true
-            }
+    /**
+     * Set text using accessibility ACTION_SET_TEXT.
+     *
+     * Returns false (without touching the field) for non-editable nodes or
+     * overlong text; the caller decides whether to fall back to the clipboard.
+     */
+    fun trySetText(
+        node: AccessibilityNodeInfo,
+        text: String,
+        append: Boolean = false
+    ): Boolean {
+        if (text.length > MAX_TEXT_LENGTH) {
+            Log.e(TAG, "Text length ${text.length} exceeds maximum of $MAX_TEXT_LENGTH")
+            return false
+        }
+        if (!node.isEditable) {
+            Log.w(TAG, "ACTION_SET_TEXT skipped: node is not editable")
+            return false
         }
 
-        // Strategy 2: Fallback to clipboard paste (for long text OR if ACTION_SET_TEXT failed)
-        Log.w(TAG, "ACTION_SET_TEXT failed, falling back to clipboard paste")
-        return inputViaClipboard(element, text, append)
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val arguments = Bundle().apply {
+            putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                if (append) (node.text?.toString() ?: "") + text else text
+            )
+        }
+
+        val success = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+        if (success) {
+            Log.d(TAG, "Text set via ACTION_SET_TEXT: ${text.length} chars, append=$append")
+        } else {
+            Log.w(TAG, "ACTION_SET_TEXT rejected by node")
+        }
+        return success
+    }
+
+    /**
+     * Fall back to clipboard paste. Only valid for editable nodes.
+     *
+     * Never logs clipboard/text contents.
+     */
+    fun tryClipboard(
+        node: AccessibilityNodeInfo,
+        text: String,
+        append: Boolean = false
+    ): Boolean {
+        if (text.length > MAX_TEXT_LENGTH) {
+            Log.e(TAG, "Text length ${text.length} exceeds maximum of $MAX_TEXT_LENGTH")
+            return false
+        }
+        if (!node.isEditable) {
+            Log.w(TAG, "Clipboard paste skipped: node is not editable")
+            return false
+        }
+        return inputViaClipboard(node, text, append)
     }
 
     /**

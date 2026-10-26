@@ -27,7 +27,7 @@ class McpHttpServer(
         const val MCP_PORT = 7474
         private const val TAG = "McpHttpServer"
         private const val SERVER_NAME = "neuralbridge-android"
-        private const val SERVER_VERSION = "0.4.0"
+        private const val SERVER_VERSION = "0.5.0"
         private const val PROTOCOL_VERSION = "2024-11-05"
         private const val SCREEN_WAKE_LOCK_TIMEOUT_MS = 5L * 60 * 1000 // 5 minutes
     }

@@ -115,4 +115,57 @@ class McpToolRegistryTest {
             ?.map { it.jsonPrimitive.content } ?: emptyList()
         assertTrue("text should be required for android_input_text", "text" in required)
     }
+
+    @Test
+    fun `android_input_text schema exposes NB-6 targeting params`() {
+        val inputText = McpToolRegistry.getTool("android_input_text")
+        assertNotNull(inputText)
+        val properties = inputText!!.inputSchema["properties"]?.jsonObject
+        assertNotNull("android_input_text missing properties", properties)
+
+        listOf(
+            "element_id", "bounds", "class_name",
+            "read_back", "allow_clipboard", "bounds_tolerance"
+        ).forEach { name ->
+            assertNotNull(
+                "android_input_text schema missing '$name'",
+                properties!![name]
+            )
+        }
+
+        // New targeting params must all be optional for backward compatibility.
+        val required = inputText.inputSchema["required"]?.jsonArray
+            ?.map { it.jsonPrimitive.content } ?: emptyList()
+        assertEquals(listOf("text"), required)
+    }
+
+    @Test
+    fun `android_find_elements schema exposes editable and visible filters`() {
+        val find = McpToolRegistry.getTool("android_find_elements")
+        assertNotNull(find)
+        val properties = find!!.inputSchema["properties"]?.jsonObject
+        assertNotNull("android_find_elements missing properties", properties)
+
+        listOf("editable", "visible", "prefer_editable").forEach { name ->
+            assertNotNull(
+                "android_find_elements schema missing '$name'",
+                properties!![name]
+            )
+        }
+    }
+
+    @Test
+    fun `android_get_focused_element exists with no required params`() {
+        val focused = McpToolRegistry.getTool("android_get_focused_element")
+        assertNotNull("Missing android_get_focused_element", focused)
+
+        val schema = focused!!.inputSchema
+        assertEquals("object", schema["type"]?.jsonPrimitive?.content)
+        assertNotNull(schema["properties"])
+        val required = schema["required"]?.jsonArray
+        assertTrue(
+            "android_get_focused_element must not require params",
+            required == null || required.isEmpty()
+        )
+    }
 }

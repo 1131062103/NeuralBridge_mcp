@@ -241,6 +241,7 @@ class UiTreeWalker(
             longClickable = node.isLongClickable,
             checkable = node.isCheckable,
             checked = node.isChecked,
+            editable = node.isEditable,
             semanticType = semanticType,
             aiDescription = aiDescription
         )
@@ -271,6 +272,24 @@ class UiTreeWalker(
 
         // Hash to create stable ID
         return hashString(combined)
+    }
+
+    /**
+     * Compute the same elementId walkTree would assign to a node.
+     *
+     * parentId is unknown for nodes obtained outside walkTree (e.g. findFocus);
+     * callers that need to match a tree element should look it up in the tree first.
+     */
+    fun elementIdFor(node: AccessibilityNodeInfo, parentId: String? = null): String {
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        return generateElementId(
+            resourceId = node.viewIdResourceName ?: "",
+            className = node.className?.toString() ?: "",
+            text = node.text?.toString() ?: "",
+            bounds = Bounds(bounds.left, bounds.top, bounds.right, bounds.bottom),
+            parentId = parentId
+        )
     }
 
     /**

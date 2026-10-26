@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="Apache 2.0 License" /></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Version-0.4.0-success" alt="v0.4.0" /></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Version-0.5.0-success" alt="v0.5.0" /></a>
   <a href="docs/TOOLS.md"><img src="https://img.shields.io/badge/MCP%20Tools-32-brightgreen" alt="32 Tools" /></a>
   <a href="docs/PERFORMANCE.md"><img src="https://img.shields.io/badge/Avg%20Latency-6.4ms-brightgreen" alt="6.4ms" /></a>
   <a href="#"><img src="https://img.shields.io/badge/Android-7.0%2B-3DDC84?logo=android&logoColor=white" alt="Android 7+" /></a>
@@ -137,6 +137,7 @@ Ask your AI agent: *"Take a screenshot of the Android device"* — if you see a 
 | ⚡ | [**Performance**](docs/PERFORMANCE.md) | Benchmarks, architecture comparison, token optimization |
 | 🔧 | [**Troubleshooting**](docs/TROUBLESHOOTING.md) | Connection issues, permissions, screenshots, crashes |
 | 🔨 | [**Development**](docs/DEVELOPMENT.md) | Building from source, project structure, protobuf, logs |
+| 📥 | [**Input Extension (NB-6)**](docs/INPUT_EXTENSION_SPEC.md) | Implemented in 0.5.0: bounds/element_id input with read-back for custom EditTexts |
 | 📱 | [**Android App**](android/README.md) | App-specific setup and permissions |
 | 🤝 | [**Contributing**](CONTRIBUTING.md) | Code style, PR process, guidelines |
 | 🔒 | [**Security**](SECURITY.md) | Vulnerability reporting policy |
