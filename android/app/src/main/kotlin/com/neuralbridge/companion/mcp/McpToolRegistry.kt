@@ -375,6 +375,12 @@ object McpToolRegistry {
             }
         ),
 
+        McpToolDefinition(
+            name = "android_sequence",
+            description = "Execute an ordered list of UI actions in one MCP call. Steps run sequentially on-device. Stops on the first failure by default, never retries mutating actions, and returns per-step results plus one final UI tree. Selector fields (text + resource_id + content_desc) are AND-matched by default inside a sequence; pass match=\"or\" for OR semantics.",
+            inputSchema = sequenceInputSchema()
+        ),
+
         // ── DEVICE ────────────────────────────────────────────────────────
         McpToolDefinition(
             name = "android_list_devices",
@@ -448,4 +454,132 @@ object McpToolRegistry {
     )
 
     fun getTool(name: String): McpToolDefinition? = getAllTools().find { it.name == name }
+
+    private fun sequenceInputSchema(): JsonObject = buildJsonObject {
+        put("type", "object")
+        putJsonObject("properties") {
+            putJsonObject("steps") {
+                put("type", "array")
+                put("minItems", 1)
+                put("maxItems", 50)
+                put("description", "Ordered actions to execute. Each step has one action plus its parameters. Supported actions: tap, input_text, wait_for_element, wait_for_gone, wait_for_idle, press_key, swipe, scroll_to_element, sleep, assert_text.")
+                putJsonObject("items") {
+                    put("type", "object")
+                    putJsonObject("properties") {
+                        putJsonObject("action") {
+                            put("type", "string")
+                            putJsonArray("enum") {
+                                listOf(
+                                    "tap", "input_text", "wait_for_element", "wait_for_gone",
+                                    "wait_for_idle", "press_key", "swipe", "scroll_to_element",
+                                    "sleep", "assert_text"
+                                ).forEach { add(JsonPrimitive(it)) }
+                            }
+                            put("description", "Action to execute.")
+                        }
+                        putJsonObject("text") {
+                            put("type", "string")
+                            put("description", "Selector text (contains, case-insensitive) for tap/wait/scroll/assert; input value for input_text.")
+                        }
+                        putJsonObject("resource_id") {
+                            put("type", "string")
+                            put("description", "Resource ID selector (exact or suffix match).")
+                        }
+                        putJsonObject("content_desc") {
+                            put("type", "string")
+                            put("description", "Content description selector.")
+                        }
+                        putJsonObject("class_name") {
+                            put("type", "string")
+                            put("description", "Class name filter (contains).")
+                        }
+                        putJsonObject("element_id") {
+                            put("type", "string")
+                            put("description", "elementId from get_ui_tree/find_elements.")
+                        }
+                        putJsonObject("element_text") {
+                            put("type", "string")
+                            put("description", "input_text: target the editable whose current text/hint contains this value.")
+                        }
+                        putJsonObject("match") {
+                            put("type", "string")
+                            putJsonArray("enum") { add(JsonPrimitive("and")); add(JsonPrimitive("or")) }
+                            put("description", "How multiple selector fields combine. Default: and.")
+                        }
+                        putJsonObject("x") { put("type", "integer"); put("description", "Tap X coordinate.") }
+                        putJsonObject("y") { put("type", "integer"); put("description", "Tap Y coordinate.") }
+                        putJsonObject("bounds") {
+                            putJsonArray("type") { add(JsonPrimitive("string")); add(JsonPrimitive("object")) }
+                            put("description", "Tap/input target bounds: \"[left,top][right,bottom]\", \"[left,top,right,bottom]\" or {left,top,right,bottom}.")
+                        }
+                        putJsonObject("append") { put("type", "boolean"); put("description", "input_text: append instead of replace.") }
+                        putJsonObject("read_back") { put("type", "boolean"); put("description", "input_text: verify by reading the field back (default true).") }
+                        putJsonObject("allow_clipboard") { put("type", "boolean"); put("description", "input_text: allow clipboard fallback (default true).") }
+                        putJsonObject("bounds_tolerance") { put("type", "integer"); put("description", "input_text: allowed per-edge bounds drift in px (default 2).") }
+                        putJsonObject("key") { put("type", "string"); put("description", "press_key: key name (back, home, enter, delete, etc.).") }
+                        putJsonObject("start_x") { put("type", "integer"); put("description", "swipe: start X.") }
+                        putJsonObject("start_y") { put("type", "integer"); put("description", "swipe: start Y.") }
+                        putJsonObject("end_x") { put("type", "integer"); put("description", "swipe: end X.") }
+                        putJsonObject("end_y") { put("type", "integer"); put("description", "swipe: end Y.") }
+                        putJsonObject("duration_ms") {
+                            put("type", "integer")
+                            put("description", "swipe/sleep: duration in ms (sleep max 60000).")
+                        }
+                        putJsonObject("direction") {
+                            put("type", "string")
+                            putJsonArray("enum") {
+                                add(JsonPrimitive("up")); add(JsonPrimitive("down"))
+                                add(JsonPrimitive("left")); add(JsonPrimitive("right"))
+                            }
+                            put("description", "scroll_to_element: scroll direction (default down).")
+                        }
+                        putJsonObject("max_scrolls") { put("type", "integer"); put("description", "scroll_to_element: max scrolls (1-100, default 20).") }
+                        putJsonObject("timeout_ms") {
+                            put("type", "integer")
+                            put("description", "Per-step timeout in ms (default 10000, capped by the overall timeout).")
+                        }
+                        putJsonObject("description") { put("type", "string"); put("description", "Short debug label. Never put passwords or account data here.") }
+                        putJsonObject("text_equals") { put("type", "string"); put("description", "assert_text: expected exact element text.") }
+                        putJsonObject("equals") { put("type", "string"); put("description", "assert_text: alias for text_equals.") }
+                        putJsonObject("text_not_equals") { put("type", "string"); put("description", "assert_text: element text must differ from this value.") }
+                        putJsonObject("contains") { put("type", "boolean"); put("description", "assert_text: selector text matching mode (default true).") }
+                    }
+                    putJsonArray("required") { add(JsonPrimitive("action")) }
+                }
+            }
+            putJsonObject("stop_on_error") {
+                put("type", "boolean")
+                put("default", true)
+                put("description", "Stop at the first failed step. When false, continue and report all failures.")
+            }
+            putJsonObject("observe") {
+                put("type", "string")
+                putJsonArray("enum") { add(JsonPrimitive("none")); add(JsonPrimitive("final")); add(JsonPrimitive("each")) }
+                put("default", "final")
+                put("description", "Return no tree, one final tree, or a tree after every step (debug only).")
+            }
+            putJsonObject("observe_filter") {
+                put("type", "string")
+                putJsonArray("enum") { add(JsonPrimitive("all")); add(JsonPrimitive("interactive")); add(JsonPrimitive("text")) }
+                put("default", "text")
+                put("description", "Filter for the returned UI tree; same semantics as android_get_ui_tree.")
+            }
+            putJsonObject("include_screenshot") {
+                put("type", "boolean")
+                put("default", false)
+                put("description", "Append a thumbnail screenshot to the final result. Off by default.")
+            }
+            putJsonObject("timeout_ms") {
+                put("type", "integer")
+                put("default", 30000)
+                put("description", "Overall sequence timeout. Individual steps may have shorter timeouts.")
+            }
+            putJsonObject("settle_ms") {
+                put("type", "integer")
+                put("default", 0)
+                put("description", "Optional wait for UI idle before the first step. Keep 0 unless needed.")
+            }
+        }
+        putJsonArray("required") { add(JsonPrimitive("steps")) }
+    }
 }

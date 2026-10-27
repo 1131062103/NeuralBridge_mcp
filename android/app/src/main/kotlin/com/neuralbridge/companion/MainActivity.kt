@@ -407,7 +407,7 @@ class MainActivity : Activity() {
 
         // Filter spinner
         val spinner = findViewById<Spinner>(R.id.logFilterSpinner)
-        val filters = arrayOf("ALL", "GESTURE", "OBSERVE", "MANAGE", "WAIT", "INPUT")
+        val filters = arrayOf("ALL", "GESTURE", "OBSERVE", "MANAGE", "WAIT", "INPUT", "SEQUENCE")
         spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, filters)
         spinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, pos: Int, id: Long) {

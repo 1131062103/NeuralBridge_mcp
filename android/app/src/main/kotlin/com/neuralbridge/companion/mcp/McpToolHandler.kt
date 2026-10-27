@@ -44,6 +44,8 @@ class McpToolHandler(
         private const val MAX_RECURSION_DEPTH = 50
     }
 
+    private val sequenceGate = SequenceGate()
+
     suspend fun handleToolCall(toolName: String, arguments: JsonObject?): McpToolCallResult {
         val args = arguments ?: JsonObject(emptyMap())
         return try {
@@ -82,6 +84,7 @@ class McpToolHandler(
                 "android_wait_for_gone" -> handleWaitForGone(args)
                 "android_wait_for_idle" -> handleWaitForIdle(args)
                 "android_scroll_to_element" -> handleScrollToElement(args)
+                "android_sequence" -> handleSequence(args)
 
                 // DEVICE (stubs — we are the device)
                 "android_list_devices" -> handleListDevices()
@@ -143,8 +146,21 @@ class McpToolHandler(
         val maxDepth = args["max_depth"]?.jsonPrimitive?.intOrNull ?: 0
         val filter = args["filter"]?.jsonPrimitive?.contentOrNull ?: "interactive"
 
-        val rootNode = service.rootInActiveWindow
+        val result = buildUiTreeJson(filter, includeInvisible, maxDepth)
             ?: return errorResult("No active window available")
+        return textResult(result.toString())
+    }
+
+    /**
+     * Shared UI-tree snapshot. The JSON is identical to android_get_ui_tree so
+     * sequence results can reuse the same client parser.
+     */
+    private suspend fun buildUiTreeJson(
+        filter: String,
+        includeInvisible: Boolean = false,
+        maxDepth: Int = 0
+    ): JsonObject? {
+        val rootNode = service.rootInActiveWindow ?: return null
 
         val tree = uiTreeWalker.walkTree(rootNode, includeInvisible, maxDepth)
 
@@ -168,7 +184,7 @@ class McpToolHandler(
             }
         }
 
-        val result = buildJsonObject {
+        return buildJsonObject {
             put("format", "compact")
             put("app", tree.foregroundApp)
             put("total", tree.totalNodes)
@@ -176,7 +192,11 @@ class McpToolHandler(
             put("filter", filter)
             put("elements", table.trimEnd())
         }
-        return textResult(result.toString())
+    }
+
+    private suspend fun currentTreeOrNull(): UiTree? {
+        val rootNode = service.rootInActiveWindow ?: return null
+        return uiTreeWalker.walkTree(rootNode)
     }
 
     private suspend fun handleScreenshot(args: JsonObject): McpToolCallResult {
@@ -524,8 +544,39 @@ class McpToolHandler(
     }
 
     private suspend fun handleInputText(args: JsonObject): McpToolCallResult {
+        args["text"]?.jsonPrimitive?.contentOrNull ?: return errorResult("text required")
+
+        return when (val outcome = performInputText(args)) {
+            is InputOutcome.Success -> {
+                val payload = buildJsonObject {
+                    put("success", true)
+                    put("method", outcome.method)
+                    putTarget(outcome.target)
+                    put("before", outcome.before)
+                    put("after", outcome.after)
+                    put("latency_ms", outcome.latencyMs)
+                }
+                textResult(payload.toString())
+            }
+
+            is InputOutcome.Failure -> {
+                if (outcome.code == "NO_ACTIVE_WINDOW") {
+                    errorResult(outcome.message)
+                } else {
+                    inputFailure(outcome.code, outcome.message, outcome.target, outcome.before, outcome.after)
+                }
+            }
+        }
+    }
+
+    /**
+     * Shared implementation for android_input_text and sequence input_text steps.
+     * Returns structured diagnostics without changing the single-tool JSON.
+     */
+    private suspend fun performInputText(args: JsonObject): InputOutcome {
         val startedAt = System.currentTimeMillis()
-        val text = args["text"]?.jsonPrimitive?.contentOrNull ?: return errorResult("text required")
+        val text = args["text"]?.jsonPrimitive?.contentOrNull
+            ?: return InputOutcome.Failure("INVALID_STEP", "text required")
         val append = args["append"]?.jsonPrimitive?.booleanOrNull ?: false
         val readBack = args["read_back"]?.jsonPrimitive?.booleanOrNull ?: true
         val allowClipboard = args["allow_clipboard"]?.jsonPrimitive?.booleanOrNull ?: true
@@ -541,19 +592,24 @@ class McpToolHandler(
             null
         } else {
             InputTargeting.parseBounds(boundsArg)
-                ?: return inputFailure(
+                ?: return InputOutcome.Failure(
                     "INVALID_BOUNDS",
                     "bounds must be \"[l,t][r,b]\", \"[l,t,r,b]\" or {left,top,right,bottom}"
                 )
         }
 
-        val rootNode = service.rootInActiveWindow ?: return errorResult("No active window")
+        val rootNode = service.rootInActiveWindow
+            ?: return InputOutcome.Failure("NO_ACTIVE_WINDOW", "No active window")
         val tree = uiTreeWalker.walkTree(rootNode)
         val spec = TargetSpec(elementId, resourceId, bounds, className, elementText, tolerance)
 
         when (val resolution = resolveTarget(rootNode, tree, spec)) {
             is TargetResolution.Failure ->
-                return inputFailure(resolution.code, resolution.message, resolution.target)
+                return InputOutcome.Failure(
+                    resolution.code,
+                    resolution.message,
+                    resolution.target
+                )
 
             is TargetResolution.Found -> {
                 val node = resolution.node
@@ -564,7 +620,7 @@ class McpToolHandler(
                     val method = when {
                         inputEngine.trySetText(node, text, append) -> "action_set_text"
                         allowClipboard && inputEngine.tryClipboard(node, text, append) -> "clipboard"
-                        else -> return inputFailure(
+                        else -> return InputOutcome.Failure(
                             "INPUT_REJECTED",
                             if (allowClipboard) {
                                 "ACTION_SET_TEXT and clipboard fallback both failed"
@@ -588,7 +644,7 @@ class McpToolHandler(
                             }
                         }
                         if (!verified) {
-                            return inputFailure(
+                            return InputOutcome.Failure(
                                 "INPUT_VERIFY_FAILED",
                                 "operation reported success but read-back did not match the requested text",
                                 target,
@@ -601,20 +657,36 @@ class McpToolHandler(
                         after = readNodeText(node)
                     }
 
-                    val payload = buildJsonObject {
-                        put("success", true)
-                        put("method", method)
-                        putTarget(target)
-                        put("before", before)
-                        put("after", after)
-                        put("latency_ms", System.currentTimeMillis() - startedAt)
-                    }
-                    return textResult(payload.toString())
+                    return InputOutcome.Success(
+                        method = method,
+                        target = target,
+                        before = before,
+                        after = after,
+                        latencyMs = System.currentTimeMillis() - startedAt
+                    )
                 } finally {
                     recycle(node)
                 }
             }
         }
+    }
+
+    private sealed class InputOutcome {
+        data class Success(
+            val method: String,
+            val target: TargetSnapshot,
+            val before: String,
+            val after: String,
+            val latencyMs: Long
+        ) : InputOutcome()
+
+        data class Failure(
+            val code: String,
+            val message: String,
+            val target: TargetSnapshot? = null,
+            val before: String? = null,
+            val after: String? = null
+        ) : InputOutcome()
     }
 
     private data class TargetSpec(
@@ -1130,7 +1202,13 @@ class McpToolHandler(
 
     private fun handlePressKey(args: JsonObject): McpToolCallResult {
         val key = args["key"]?.jsonPrimitive?.contentOrNull ?: return errorResult("key required")
+        val error = pressKeyInternal(key)
+        return if (error == null) textResult("{\"key\":\"$key\",\"latency_ms\":0}")
+        else errorResult(error)
+    }
 
+    /** Returns null on success, or a client-safe error message. */
+    private fun pressKeyInternal(key: String): String? {
         // Global actions first (don't need a focused node)
         val globalAction = when (key.lowercase()) {
             "back" -> android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK
@@ -1142,7 +1220,7 @@ class McpToolHandler(
         }
         if (globalAction != null) {
             service.performGlobalAction(globalAction)
-            return textResult("{\"key\":\"$key\",\"latency_ms\":0}")
+            return null
         }
 
         // For other keys, delegate to InputEngine
@@ -1152,8 +1230,8 @@ class McpToolHandler(
         val success = inputEngine.pressKey(key, focusedNode)
         @Suppress("DEPRECATION")
         focusedNode?.recycle()
-        return if (success) textResult("{\"key\":\"$key\",\"latency_ms\":0}")
-        else errorResult("Key '$key' not supported or no focused input field. Supported: back, home, recents, notifications, power (global); enter, delete/backspace, tab, escape, space, select_all, cut, copy, paste (requires focused field).")
+        return if (success) null
+        else "Key '$key' not supported or no focused input field. Supported: back, home, recents, notifications, power (global); enter, delete/backspace, tab, escape, space, select_all, cut, copy, paste (requires focused field)."
     }
 
     private fun handleGlobalAction(args: JsonObject): McpToolCallResult {
@@ -1325,6 +1403,494 @@ class McpToolHandler(
             delay(200)
         }
         return textResult("{\"found\":false,\"scrolls\":$maxScrolls}")
+    }
+
+    // =====================================================================
+    // SEQUENCE TOOL
+    // =====================================================================
+
+    /**
+     * Execute an ordered batch of UI actions in one MCP call.
+     *
+     * Mutating steps run exactly once; failures never trigger retries. The gate
+     * prevents two sequences from interleaving on the same device.
+     */
+    private suspend fun handleSequence(args: JsonObject): McpToolCallResult {
+        val parsed = SequenceValidation.parse(args)
+        if (parsed is SequenceParseResult.Invalid) {
+            return sequenceErrorResult(parsed.code, parsed.message, parsed.step)
+        }
+        val plan = (parsed as SequenceParseResult.Valid).plan
+
+        if (!sequenceGate.tryEnter()) {
+            return sequenceErrorResult(
+                SequenceErrors.SEQUENCE_BUSY,
+                "another sequence is already running on this device"
+            )
+        }
+
+        return try {
+            val startedNs = System.nanoTime()
+            if (plan.settleMs > 0) {
+                withTimeoutOrNull(minOf(plan.settleMs, plan.timeoutMs)) {
+                    waitForIdleInternal(plan.settleMs)
+                }
+            }
+
+            // Settle time counts against the overall timeout.
+            val settleElapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
+            val effectivePlan = plan.copy(
+                timeoutMs = (plan.timeoutMs - settleElapsedMs).coerceAtLeast(0)
+            )
+
+            val runner = SequenceStepRunner { step, timeoutMs ->
+                executeSequenceStep(step, timeoutMs)
+            }
+            val result = SequenceExecutor { buildUiTreeJson(effectivePlan.observeFilter) }
+                .execute(effectivePlan, runner)
+
+            var payload = result.toJson()
+            var screenshot: String? = null
+
+            if (plan.includeScreenshot) {
+                try {
+                    val jpegBytes = screenshotPipeline.capture(ScreenshotQuality.THUMBNAIL)
+                    screenshot = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+                } catch (e: Exception) {
+                    payload = JsonObject(
+                        payload.toMutableMap().apply {
+                            put(
+                                "screenshot_error",
+                                JsonPrimitive(e.message ?: "screenshot failed")
+                            )
+                        }
+                    )
+                }
+            }
+
+            val content = mutableListOf(
+                McpContentBlock(type = "text", text = payload.toString())
+            )
+            if (screenshot != null) {
+                content.add(
+                    McpContentBlock(
+                        type = "image",
+                        data = screenshot,
+                        mimeType = "image/jpeg"
+                    )
+                )
+            }
+
+            McpToolCallResult(content = content, isError = !result.success)
+        } finally {
+            sequenceGate.exit()
+        }
+    }
+
+    private fun sequenceErrorResult(
+        code: String,
+        message: String,
+        step: Int? = null
+    ): McpToolCallResult = McpToolCallResult(
+        content = listOf(
+            McpContentBlock(type = "text", text = sequenceFailureJson(code, message, step).toString())
+        ),
+        isError = true
+    )
+
+    private suspend fun executeSequenceStep(
+        step: SequenceStep,
+        timeoutMs: Long
+    ): SequenceStepResult = try {
+        when (step.action) {
+            "tap" -> executeTapStep(step)
+            "input_text" -> executeInputTextStep(step)
+            "wait_for_element" -> executeWaitForElementStep(step, timeoutMs)
+            "wait_for_gone" -> executeWaitForGoneStep(step, timeoutMs)
+            "wait_for_idle" ->
+                if (waitForIdleInternal(timeoutMs)) stepOk()
+                else stepFailure(
+                    SequenceErrors.STEP_TIMEOUT,
+                    "wait_for_idle timed out after ${timeoutMs}ms"
+                )
+            "press_key" -> executePressKeyStep(step)
+            "swipe" -> executeSwipeStep(step)
+            "scroll_to_element" -> executeScrollToElementStep(step, timeoutMs)
+            "sleep" -> {
+                val durationMs = (step.args["duration_ms"] as? JsonPrimitive)?.longOrNull ?: 0L
+                delay(durationMs)
+                stepOk()
+            }
+            "assert_text" -> executeAssertTextStep(step)
+            else -> stepFailure(SequenceErrors.INVALID_STEP, "unknown action '${step.action}'")
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Log.e(TAG, "Sequence step ${step.index} (${step.action}) failed", e)
+        stepFailure(
+            SequenceErrors.STEP_GESTURE_FAILED,
+            "step failed while executing '${step.action}'"
+        )
+    }
+
+    private fun stepOk(detail: JsonObject? = null) =
+        SequenceStepResult(ok = true, detail = detail)
+
+    private fun stepFailure(code: String, message: String, detail: JsonObject? = null) =
+        SequenceStepResult(ok = false, detail = detail, error = SequenceStepError(code, message))
+
+    private fun matchMode(args: JsonObject): SequenceMatchMode =
+        SequenceMatchMode.fromWire(args.stringOrNull("match")) ?: SequenceMatchMode.AND
+
+    private suspend fun executeTapStep(step: SequenceStep): SequenceStepResult {
+        val args = step.args
+        val x = (args["x"] as? JsonPrimitive)?.intOrNull
+        val y = (args["y"] as? JsonPrimitive)?.intOrNull
+
+        val point: Pair<Float, Float> = if (x != null && y != null) {
+            x.toFloat() to y.toFloat()
+        } else {
+            val bounds = InputTargeting.parseBounds(args["bounds"])
+            if (bounds != null) {
+                ((bounds.left + bounds.right) / 2f) to ((bounds.top + bounds.bottom) / 2f)
+            } else {
+                val tree = currentTreeOrNull()
+                    ?: return stepFailure(
+                        SequenceErrors.STEP_TARGET_NOT_FOUND,
+                        "No active window"
+                    )
+                val selector = SequenceSelector.from(args)
+                when (val selection = selectSequenceElement(tree.elements, selector, matchMode(args))) {
+                    is SequenceSelection.Found -> {
+                        val b = selection.element.bounds
+                            ?: return stepFailure(
+                                SequenceErrors.STEP_TARGET_NOT_FOUND,
+                                "tap target has no bounds: ${selector.describe()}"
+                            )
+                        ((b.left + b.right) / 2f) to ((b.top + b.bottom) / 2f)
+                    }
+
+                    SequenceSelection.NotFound -> return stepFailure(
+                        SequenceErrors.STEP_TARGET_NOT_FOUND,
+                        "tap target not found: ${selector.describe()}"
+                    )
+
+                    is SequenceSelection.Ambiguous -> return stepFailure(
+                        SequenceErrors.STEP_TARGET_AMBIGUOUS,
+                        "multiple elements match: ${selector.describe()}; add class_name or use element_id"
+                    )
+                }
+            }
+        }
+
+        val success = withTimeoutOrNull(5000L) {
+            executeGestureAndWait { cb ->
+                gestureEngine.executeTap(point.first, point.second, cb)
+            }
+        } ?: false
+
+        return if (success) {
+            stepOk(buildJsonObject {
+                put("x", point.first.toInt())
+                put("y", point.second.toInt())
+            })
+        } else {
+            stepFailure(SequenceErrors.STEP_GESTURE_FAILED, "tap gesture was cancelled or timed out")
+        }
+    }
+
+    private suspend fun executeInputTextStep(step: SequenceStep): SequenceStepResult =
+        when (val outcome = performInputText(step.args)) {
+            is InputOutcome.Success -> stepOk(buildJsonObject {
+                put("method", outcome.method)
+                putTarget(outcome.target)
+                put("before", outcome.before)
+                put("after", outcome.after)
+            })
+
+            is InputOutcome.Failure -> {
+                val detail = buildJsonObject {
+                    outcome.target?.let { putTarget(it) }
+                    outcome.before?.let { put("before", it) }
+                    outcome.after?.let { put("after", it) }
+                }
+                stepFailure(mapInputErrorCode(outcome.code), outcome.message, detail)
+            }
+        }
+
+    private fun mapInputErrorCode(code: String): String = when (code) {
+        "TARGET_NOT_FOUND", "NO_ACTIVE_WINDOW" -> SequenceErrors.STEP_TARGET_NOT_FOUND
+        "TARGET_AMBIGUOUS" -> SequenceErrors.STEP_TARGET_AMBIGUOUS
+        "INPUT_NOT_EDITABLE" -> SequenceErrors.STEP_NOT_EDITABLE
+        "INPUT_VERIFY_FAILED" -> SequenceErrors.STEP_INPUT_VERIFY_FAILED
+        "INVALID_BOUNDS", "INVALID_STEP" -> SequenceErrors.INVALID_STEP
+        else -> SequenceErrors.STEP_INPUT_REJECTED
+    }
+
+    private suspend fun executeWaitForElementStep(
+        step: SequenceStep,
+        timeoutMs: Long
+    ): SequenceStepResult {
+        val selector = SequenceSelector.from(step.args)
+        val match = matchMode(step.args)
+        val deadlineNs = System.nanoTime() + timeoutMs * 1_000_000L
+
+        while (true) {
+            val tree = currentTreeOrNull()
+            if (tree != null) {
+                when (val selection = selectSequenceElement(tree.elements, selector, match)) {
+                    is SequenceSelection.Found -> return stepOk(buildJsonObject {
+                        put("found", true)
+                        putJsonObject("element") {
+                            put("elementId", selection.element.elementId)
+                            selection.element.resourceId?.let { put("resourceId", it) }
+                            selection.element.bounds?.let { put("bounds", formatBounds(it)) }
+                        }
+                    })
+
+                    is SequenceSelection.Ambiguous -> return stepOk(buildJsonObject {
+                        put("found", true)
+                        put("ambiguous", true)
+                        put("matches", selection.count)
+                    })
+
+                    SequenceSelection.NotFound -> Unit
+                }
+            }
+
+            val remainingMs = (deadlineNs - System.nanoTime()) / 1_000_000L
+            if (remainingMs <= 0) break
+            delay(minOf(POLL_INTERVAL_MS, remainingMs))
+        }
+
+        return stepFailure(
+            SequenceErrors.STEP_TIMEOUT,
+            "wait_for_element timed out after ${timeoutMs}ms: ${selector.describe()}"
+        )
+    }
+
+    private suspend fun executeWaitForGoneStep(
+        step: SequenceStep,
+        timeoutMs: Long
+    ): SequenceStepResult {
+        val selector = SequenceSelector.from(step.args)
+        val match = matchMode(step.args)
+        val deadlineNs = System.nanoTime() + timeoutMs * 1_000_000L
+
+        while (true) {
+            val tree = currentTreeOrNull()
+            if (tree != null) {
+                val selection = selectSequenceElement(tree.elements, selector, match)
+                if (selection is SequenceSelection.NotFound) {
+                    return stepOk(buildJsonObject { put("found", false) })
+                }
+            }
+
+            val remainingMs = (deadlineNs - System.nanoTime()) / 1_000_000L
+            if (remainingMs <= 0) break
+            delay(minOf(POLL_INTERVAL_MS, remainingMs))
+        }
+
+        return stepFailure(
+            SequenceErrors.STEP_TIMEOUT,
+            "wait_for_gone timed out after ${timeoutMs}ms: ${selector.describe()}"
+        )
+    }
+
+    private suspend fun executePressKeyStep(step: SequenceStep): SequenceStepResult {
+        val key = step.args.stringOrNull("key")
+            ?: return stepFailure(SequenceErrors.INVALID_STEP, "'key' is required")
+        val error = pressKeyInternal(key)
+        return if (error == null) {
+            stepOk(buildJsonObject { put("key", key) })
+        } else {
+            stepFailure(SequenceErrors.STEP_INPUT_REJECTED, error)
+        }
+    }
+
+    private suspend fun executeSwipeStep(step: SequenceStep): SequenceStepResult {
+        val args = step.args
+        val startX = (args["start_x"] as? JsonPrimitive)?.intOrNull
+            ?: return stepFailure(SequenceErrors.INVALID_STEP, "'start_x' is required")
+        val startY = (args["start_y"] as? JsonPrimitive)?.intOrNull
+            ?: return stepFailure(SequenceErrors.INVALID_STEP, "'start_y' is required")
+        val endX = (args["end_x"] as? JsonPrimitive)?.intOrNull
+            ?: return stepFailure(SequenceErrors.INVALID_STEP, "'end_x' is required")
+        val endY = (args["end_y"] as? JsonPrimitive)?.intOrNull
+            ?: return stepFailure(SequenceErrors.INVALID_STEP, "'end_y' is required")
+        val durationMs = (args["duration_ms"] as? JsonPrimitive)?.longOrNull ?: 300L
+
+        val success = withTimeoutOrNull(durationMs + 2000L) {
+            executeGestureAndWait { cb ->
+                gestureEngine.executeSwipe(
+                    startX.toFloat(),
+                    startY.toFloat(),
+                    endX.toFloat(),
+                    endY.toFloat(),
+                    durationMs,
+                    cb
+                )
+            }
+        } ?: false
+
+        return if (success) stepOk()
+        else stepFailure(SequenceErrors.STEP_GESTURE_FAILED, "swipe gesture was cancelled or timed out")
+    }
+
+    private suspend fun executeScrollToElementStep(
+        step: SequenceStep,
+        timeoutMs: Long
+    ): SequenceStepResult {
+        val args = step.args
+        val selector = SequenceSelector.from(args)
+        val match = matchMode(args)
+        val direction = args.stringOrNull("direction") ?: "down"
+        val maxScrolls = (args["max_scrolls"] as? JsonPrimitive)?.intOrNull ?: 20
+
+        val dm = service.resources.displayMetrics
+        val centerX = dm.widthPixels / 2f
+        val centerY = dm.heightPixels / 2f
+        val startX: Float
+        val startY: Float
+        val endX: Float
+        val endY: Float
+
+        when (direction) {
+            "up" -> {
+                startX = centerX; startY = dm.heightPixels * 0.3f
+                endX = centerX; endY = dm.heightPixels * 0.7f
+            }
+            "left" -> {
+                startX = dm.widthPixels * 0.8f; startY = centerY
+                endX = dm.widthPixels * 0.2f; endY = centerY
+            }
+            "right" -> {
+                startX = dm.widthPixels * 0.2f; startY = centerY
+                endX = dm.widthPixels * 0.8f; endY = centerY
+            }
+            else -> {
+                startX = centerX; startY = dm.heightPixels * 0.7f
+                endX = centerX; endY = dm.heightPixels * 0.3f
+            }
+        }
+
+        val deadlineNs = System.nanoTime() + timeoutMs * 1_000_000L
+
+        repeat(maxScrolls) { scrollCount ->
+            val tree = currentTreeOrNull()
+            if (tree != null) {
+                if (selectSequenceElement(tree.elements, selector, match) !is SequenceSelection.NotFound) {
+                    return stepOk(buildJsonObject {
+                        put("found", true)
+                        put("scrolls", scrollCount)
+                    })
+                }
+            }
+
+            val remainingMs = (deadlineNs - System.nanoTime()) / 1_000_000L
+            if (remainingMs <= 0) {
+                return stepFailure(
+                    SequenceErrors.STEP_TIMEOUT,
+                    "scroll_to_element timed out after ${timeoutMs}ms: ${selector.describe()}"
+                )
+            }
+
+            withTimeoutOrNull(minOf(1000L, remainingMs)) {
+                executeGestureAndWait { cb ->
+                    gestureEngine.executeSwipe(startX, startY, endX, endY, 300L, cb)
+                }
+            }
+
+            val afterScrollMs = (deadlineNs - System.nanoTime()) / 1_000_000L
+            if (afterScrollMs <= 0) {
+                return stepFailure(
+                    SequenceErrors.STEP_TIMEOUT,
+                    "scroll_to_element timed out after ${timeoutMs}ms: ${selector.describe()}"
+                )
+            }
+            delay(minOf(200L, afterScrollMs))
+        }
+
+        return stepFailure(
+            SequenceErrors.STEP_TARGET_NOT_FOUND,
+            "scroll_to_element did not find target after $maxScrolls scrolls: ${selector.describe()}"
+        )
+    }
+
+    private suspend fun executeAssertTextStep(step: SequenceStep): SequenceStepResult {
+        val args = step.args
+        val selector = SequenceSelector.from(args)
+        val match = matchMode(args)
+        val contains = (args["contains"] as? JsonPrimitive)?.booleanOrNull ?: true
+
+        val tree = currentTreeOrNull()
+            ?: return stepFailure(SequenceErrors.STEP_ASSERT_FAILED, "No active window")
+
+        val element = when (val selection = selectSequenceElement(
+            tree.elements,
+            selector,
+            match,
+            textContains = contains
+        )) {
+            is SequenceSelection.Found -> selection.element
+            SequenceSelection.NotFound -> return stepFailure(
+                SequenceErrors.STEP_ASSERT_FAILED,
+                "assert_text target not found: ${selector.describe()}"
+            )
+            is SequenceSelection.Ambiguous -> return stepFailure(
+                SequenceErrors.STEP_ASSERT_FAILED,
+                "assert_text matched multiple elements: ${selector.describe()}"
+            )
+        }
+
+        val actual = (element.text ?: element.contentDescription).orEmpty().trim()
+
+        val forbidden = args.stringOrNull("text_not_equals")
+        if (forbidden != null && actual == forbidden.trim()) {
+            return stepFailure(
+                SequenceErrors.STEP_ASSERT_FAILED,
+                "assert_text: element text still equals the forbidden value"
+            )
+        }
+
+        val expected = args.stringOrNull("equals") ?: args.stringOrNull("text_equals")
+        if (expected != null && actual != expected.trim()) {
+            return stepFailure(
+                SequenceErrors.STEP_ASSERT_FAILED,
+                "assert_text: element text did not match the expected value"
+            )
+        }
+
+        return stepOk(buildJsonObject {
+            putJsonObject("element") {
+                put("elementId", element.elementId)
+                element.resourceId?.let { put("resourceId", it) }
+                element.bounds?.let { put("bounds", formatBounds(it)) }
+            }
+        })
+    }
+
+    private suspend fun waitForIdleInternal(timeoutMs: Long): Boolean {
+        var lastEventTime = System.currentTimeMillis()
+        val idleThreshold = 500L
+
+        val listener = object : AccessibilityEventListener {
+            override fun onEvent(event: android.view.accessibility.AccessibilityEvent) {
+                lastEventTime = System.currentTimeMillis()
+            }
+        }
+        service.registerEventListener(listener)
+        return try {
+            withTimeoutOrNull(timeoutMs) {
+                while (System.currentTimeMillis() - lastEventTime < idleThreshold) {
+                    delay(idleThreshold)
+                }
+                true
+            } ?: false
+        } finally {
+            service.unregisterEventListener(listener)
+        }
     }
 
     // =====================================================================

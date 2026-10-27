@@ -16,8 +16,8 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="Apache 2.0 License" /></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Version-0.5.0-success" alt="v0.5.0" /></a>
-  <a href="docs/TOOLS.md"><img src="https://img.shields.io/badge/MCP%20Tools-32-brightgreen" alt="32 Tools" /></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Version-0.6.0-success" alt="v0.6.0" /></a>
+  <a href="docs/TOOLS.md"><img src="https://img.shields.io/badge/MCP%20Tools-34-brightgreen" alt="34 Tools" /></a>
   <a href="docs/PERFORMANCE.md"><img src="https://img.shields.io/badge/Avg%20Latency-6.4ms-brightgreen" alt="6.4ms" /></a>
   <a href="#"><img src="https://img.shields.io/badge/Android-7.0%2B-3DDC84?logo=android&logoColor=white" alt="Android 7+" /></a>
   <a href="#"><img src="https://img.shields.io/badge/Kotlin-2.0-7F52FF?logo=kotlin&logoColor=white" alt="Kotlin" /></a>
@@ -49,7 +49,7 @@ NeuralBridge takes a different approach: an on-device AccessibilityService that 
 | 🌳 UI tree read | **18-33ms** | 500-2000ms | 750ms-2s | 1-5s | 200-500ms | 1-5s |
 | 📸 Screenshot | **~60ms** | 300-500ms | ~1s | 300-500ms | ~250ms | 300-500ms |
 | 🔌 MCP native | **Yes** | Add-on | Yes (stdio) | Yes | Via adapter | No |
-| 🛠️ MCP tools | **43** | 30+ (add-on) | 14+ | ~19 | ~11 | — |
+| 🛠️ MCP tools | **34** | 30+ (add-on) | 14+ | ~19 | ~11 | — |
 | 🎯 Token optimization | **Yes (73%)** | No | No | No | No | No |
 
 > [!TIP]
@@ -133,7 +133,7 @@ Ask your AI agent: *"Take a screenshot of the Android device"* — if you see a 
 | | Document | What's inside |
 |---|---|---|
 | 🏗️ | [**Architecture**](docs/ARCHITECTURE.md) | Data flow, command paths, selector system, limitations |
-| 🛠️ | [**Tools Reference**](docs/TOOLS.md) | All 32 MCP tools with descriptions and latencies |
+| 🛠️ | [**Tools Reference**](docs/TOOLS.md) | All 34 MCP tools with descriptions and latencies |
 | ⚡ | [**Performance**](docs/PERFORMANCE.md) | Benchmarks, architecture comparison, token optimization |
 | 🔧 | [**Troubleshooting**](docs/TROUBLESHOOTING.md) | Connection issues, permissions, screenshots, crashes |
 | 🔨 | [**Development**](docs/DEVELOPMENT.md) | Building from source, project structure, protobuf, logs |

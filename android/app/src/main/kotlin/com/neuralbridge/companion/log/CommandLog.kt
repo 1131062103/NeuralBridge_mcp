@@ -6,7 +6,7 @@ package com.neuralbridge.companion.log
 object CommandLog {
 
     enum class Category {
-        GESTURE, OBSERVE, MANAGE, WAIT, CONNECT, INPUT
+        GESTURE, OBSERVE, MANAGE, WAIT, CONNECT, INPUT, SEQUENCE
     }
 
     data class Entry(
@@ -14,7 +14,9 @@ object CommandLog {
         val command: String,
         val latencyMs: Int,
         val success: Boolean,
-        val category: Category
+        val category: Category,
+        /** Optional non-sensitive summary (e.g. "steps=6"). Never input text. */
+        val detail: String? = null
     )
 
     data class Stats(

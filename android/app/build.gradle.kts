@@ -13,8 +13,8 @@ android {
         applicationId = "com.neuralbridge.companion"
         minSdk = 24  // Android 7.0 - required for AccessibilityService.dispatchGesture()
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

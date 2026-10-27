@@ -46,7 +46,7 @@
 *.dex
 *.class
 *.jar
-!/gradle/wrapper/gradle-wrapper.jar
+!**/gradle/wrapper/gradle-wrapper.jar
 
 # Signing files
 *.jks

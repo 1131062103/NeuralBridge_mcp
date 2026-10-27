@@ -27,7 +27,7 @@ class McpHttpServer(
         const val MCP_PORT = 7474
         private const val TAG = "McpHttpServer"
         private const val SERVER_NAME = "neuralbridge-android"
-        private const val SERVER_VERSION = "0.5.0"
+        private const val SERVER_VERSION = "0.6.0"
         private const val PROTOCOL_VERSION = "2024-11-05"
         private const val SCREEN_WAKE_LOCK_TIMEOUT_MS = 5L * 60 * 1000 // 5 minutes
     }
@@ -202,6 +202,11 @@ class McpHttpServer(
 
         Log.d(TAG, "tools/call: $toolName")
 
+        // Non-sensitive summary for the on-device log; arguments are never logged.
+        val logDetail = if (toolName == "android_sequence") {
+            (arguments?.get("steps") as? JsonArray)?.size?.let { "steps=$it" }
+        } else null
+
         val startMs = System.currentTimeMillis()
         return try {
             val result = toolHandler.handleToolCall(toolName, arguments)
@@ -211,7 +216,8 @@ class McpHttpServer(
                 command = toolName,
                 latencyMs = latencyMs,
                 success = !result.isError,
-                category = toolCategory(toolName)
+                category = toolCategory(toolName),
+                detail = logDetail
             ))
             successResponse(request.id, buildJsonObject {
                 putJsonArray("content") {
@@ -233,7 +239,8 @@ class McpHttpServer(
                 command = toolName,
                 latencyMs = latencyMs,
                 success = false,
-                category = toolCategory(toolName)
+                category = toolCategory(toolName),
+                detail = logDetail
             ))
             Log.e(TAG, "Tool execution error: $toolName", e)
             errorResponse(request.id, JsonRpcErrorCodes.INTERNAL_ERROR, "Tool error: ${e.message ?: "unknown"}")
@@ -241,6 +248,7 @@ class McpHttpServer(
     }
 
     private fun toolCategory(toolName: String): CommandLog.Category = when {
+        toolName == "android_sequence" -> CommandLog.Category.SEQUENCE
         toolName in setOf("android_tap", "android_long_press", "android_double_tap",
             "android_swipe", "android_pinch", "android_drag") -> CommandLog.Category.GESTURE
         toolName in setOf("android_get_ui_tree", "android_screenshot", "android_find_elements",

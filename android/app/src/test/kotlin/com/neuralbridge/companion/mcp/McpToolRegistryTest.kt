@@ -155,6 +155,48 @@ class McpToolRegistryTest {
     }
 
     @Test
+    fun `android_sequence exists with steps required and 1 to 50 items`() {
+        val tool = McpToolRegistry.getTool("android_sequence")
+        assertNotNull("Missing android_sequence", tool)
+
+        val schema = tool!!.inputSchema
+        assertEquals("object", schema["type"]?.jsonPrimitive?.content)
+
+        val required = schema["required"]?.jsonArray
+            ?.map { it.jsonPrimitive.content } ?: emptyList()
+        assertEquals(listOf("steps"), required)
+
+        val properties = schema["properties"]?.jsonObject
+        assertNotNull("android_sequence missing properties", properties)
+        val steps = properties!!["steps"]?.jsonObject
+        assertNotNull("android_sequence missing steps schema", steps)
+        assertEquals("array", steps!!["type"]?.jsonPrimitive?.content)
+        assertEquals(1, steps["minItems"]?.jsonPrimitive?.int)
+        assertEquals(50, steps["maxItems"]?.jsonPrimitive?.int)
+
+        listOf(
+            "stop_on_error", "observe", "observe_filter",
+            "include_screenshot", "timeout_ms", "settle_ms"
+        ).forEach { name ->
+            assertNotNull("android_sequence schema missing '$name'", properties[name])
+        }
+
+        // Every documented action must be offered by the step schema.
+        val actions = steps["items"]?.jsonObject
+            ?.get("properties")?.jsonObject
+            ?.get("action")?.jsonObject
+            ?.get("enum")?.jsonArray
+            ?.map { it.jsonPrimitive.content }
+            ?: emptyList()
+        listOf(
+            "tap", "input_text", "wait_for_element", "wait_for_gone", "wait_for_idle",
+            "press_key", "swipe", "scroll_to_element", "sleep", "assert_text"
+        ).forEach { action ->
+            assertTrue("android_sequence missing action '$action'", action in actions)
+        }
+    }
+
+    @Test
     fun `android_get_focused_element exists with no required params`() {
         val focused = McpToolRegistry.getTool("android_get_focused_element")
         assertNotNull("Missing android_get_focused_element", focused)

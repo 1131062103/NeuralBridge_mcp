@@ -363,6 +363,44 @@ async def run(host: str, port: int):
             await asyncio.sleep(0.5)
 
             await narrate(
+                "Batch time: the same kind of multi-step flow can run in ONE "
+                "round trip with android_sequence. Failures stop the batch and "
+                "are reported per step — mutating actions are never retried."
+            )
+            await call(
+                "android_launch_app",
+                {"package_name": "com.android.settings", "clear_task": True},
+            )
+            await call("android_wait_for_idle")
+            await call(
+                "android_sequence",
+                {
+                    "settle_ms": 300,
+                    "steps": [
+                        {"action": "tap", "text": "Search"},
+                        {
+                            "action": "wait_for_element",
+                            "resource_id": search_field,
+                            "timeout_ms": 3000,
+                        },
+                        {
+                            "action": "input_text",
+                            "text": "display",
+                            "resource_id": search_field,
+                        },
+                        {
+                            "action": "assert_text",
+                            "resource_id": search_field,
+                            "text_equals": "display",
+                        },
+                    ],
+                    "observe": "final",
+                    "observe_filter": "text",
+                },
+            )
+            await asyncio.sleep(0.5)
+
+            await narrate(
                 "And Escape to back out — this maps to the system Back action."
             )
             await call("android_press_key", {"key": "escape"})
