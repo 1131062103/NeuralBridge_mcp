@@ -1,5 +1,7 @@
 package com.neuralbridge.companion.mcp
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Rect
@@ -18,6 +20,7 @@ import com.neuralbridge.companion.input.InputTargeting.textMatches
 import com.neuralbridge.companion.notification.NotificationListener
 import com.neuralbridge.companion.screenshot.ScreenshotPipeline
 import com.neuralbridge.companion.service.AccessibilityEventListener
+import com.neuralbridge.companion.service.CompanionServices
 import com.neuralbridge.companion.service.GestureResultCallback
 import com.neuralbridge.companion.service.NeuralBridgeAccessibilityService
 import com.neuralbridge.companion.service.Bounds
@@ -31,23 +34,55 @@ import android.accessibilityservice.GestureDescription
 import kotlin.coroutines.resume
 
 class McpToolHandler(
-    private val service: NeuralBridgeAccessibilityService,
-    private val gestureEngine: GestureEngine,
-    private val uiTreeWalker: UiTreeWalker,
-    private val inputEngine: InputEngine,
-    private val screenshotPipeline: ScreenshotPipeline
+    private val appContext: Context,
+    private val servicesProvider: () -> CompanionServices?
 ) {
     companion object {
         private const val TAG = "McpToolHandler"
         private const val DEFAULT_TIMEOUT_MS = 10000L
         private const val POLL_INTERVAL_MS = 300L
         private const val MAX_RECURSION_DEPTH = 50
+
+        /** Stable error code when the AccessibilityService is not bound. */
+        const val ACCESSIBILITY_NOT_CONNECTED = "ACCESSIBILITY_NOT_CONNECTED"
+
+        /**
+         * Tools that work without the AccessibilityService. Everything else
+         * answers ACCESSIBILITY_NOT_CONNECTED instead of throwing an NPE.
+         */
+        private val ACCESSIBILITY_INDEPENDENT_TOOLS = setOf(
+            "android_get_notifications",
+            "android_get_recent_toasts",
+            "android_launch_app",
+            "android_open_url",
+            "android_set_clipboard",
+            "android_list_apps",
+            "android_get_device_info",
+            "android_list_devices",
+            "android_select_device",
+            "android_search_tools",
+            "android_describe_tools"
+        )
     }
+
+    // Resolved per call so the MCP server survives accessibility reconnects.
+    private val companionServices: CompanionServices
+        get() = servicesProvider()
+            ?: throw IllegalStateException("Accessibility service is not connected")
+
+    private val service: NeuralBridgeAccessibilityService get() = companionServices.service
+    private val gestureEngine: GestureEngine get() = companionServices.gestureEngine
+    private val uiTreeWalker: UiTreeWalker get() = companionServices.uiTreeWalker
+    private val inputEngine: InputEngine get() = companionServices.inputEngine
+    private val screenshotPipeline: ScreenshotPipeline get() = companionServices.screenshotPipeline
 
     private val sequenceGate = SequenceGate()
 
     suspend fun handleToolCall(toolName: String, arguments: JsonObject?): McpToolCallResult {
         val args = arguments ?: JsonObject(emptyMap())
+        if (toolName !in ACCESSIBILITY_INDEPENDENT_TOOLS && servicesProvider() == null) {
+            return accessibilityNotConnectedResult()
+        }
         return try {
             when (toolName) {
                 // OBSERVE
@@ -105,6 +140,20 @@ class McpToolHandler(
             errorResult("Tool error: ${e.message}")
         }
     }
+
+    private fun accessibilityNotConnectedResult(): McpToolCallResult = errorResult(
+        buildJsonObject {
+            put("success", false)
+            putJsonObject("error") {
+                put("code", ACCESSIBILITY_NOT_CONNECTED)
+                put(
+                    "message",
+                    "Accessibility service is not connected. " +
+                        "Enable NeuralBridge in Settings > Accessibility, then retry."
+                )
+            }
+        }.toString()
+    )
 
     // =====================================================================
     // GESTURE BRIDGE: callback → suspend
@@ -1257,12 +1306,12 @@ class McpToolHandler(
         val packageName = args["package_name"]?.jsonPrimitive?.contentOrNull ?: return errorResult("package_name required")
         val clearTask = args["clear_task"]?.jsonPrimitive?.booleanOrNull ?: false
 
-        val pm = service.packageManager
+        val pm = appContext.packageManager
         val launchIntent = pm.getLaunchIntentForPackage(packageName)
             ?: return errorResult("No launch intent found for package: $packageName")
         if (clearTask) launchIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK or Intent.FLAG_ACTIVITY_NEW_TASK)
         else launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        service.startActivity(launchIntent)
+        appContext.startActivity(launchIntent)
         return textResult("{\"package_name\":\"$packageName\",\"latency_ms\":0}")
     }
 
@@ -1276,19 +1325,20 @@ class McpToolHandler(
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        service.startActivity(intent)
+        appContext.startActivity(intent)
         return textResult("{\"url\":\"$url\",\"latency_ms\":0}")
     }
 
     private fun handleSetClipboard(args: JsonObject): McpToolCallResult {
         val text = args["text"]?.jsonPrimitive?.contentOrNull ?: return errorResult("text required")
-        inputEngine.setClipboardText(text)
+        val clipboard = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("NeuralBridge", text))
         return textResult("{\"success\":true}")
     }
 
     private fun handleListApps(args: JsonObject): McpToolCallResult {
         val filter = args["filter"]?.jsonPrimitive?.contentOrNull ?: "all"
-        val pm = service.packageManager
+        val pm = appContext.packageManager
         val packages = pm.getInstalledPackages(0)
         val filtered = when (filter) {
             "system" -> packages.filter { (it.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0 }
@@ -1898,7 +1948,7 @@ class McpToolHandler(
     // =====================================================================
 
     private fun handleListDevices(): McpToolCallResult {
-        val dm = service.resources.displayMetrics
+        val dm = appContext.resources.displayMetrics
         val result = buildJsonObject {
             putJsonArray("devices") {
                 addJsonObject {
@@ -1964,7 +2014,7 @@ class McpToolHandler(
     }
 
     private fun handleGetDeviceInfo(): McpToolCallResult {
-        val dm = service.resources.displayMetrics
+        val dm = appContext.resources.displayMetrics
         val result = buildJsonObject {
             put("manufacturer", Build.MANUFACTURER)
             put("model", Build.MODEL)

@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="Apache 2.0 License" /></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Version-0.6.0-success" alt="v0.6.0" /></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Version-0.7.0-success" alt="v0.7.0" /></a>
   <a href="docs/TOOLS.md"><img src="https://img.shields.io/badge/MCP%20Tools-34-brightgreen" alt="34 Tools" /></a>
   <a href="docs/PERFORMANCE.md"><img src="https://img.shields.io/badge/Avg%20Latency-6.4ms-brightgreen" alt="6.4ms" /></a>
   <a href="#"><img src="https://img.shields.io/badge/Android-7.0%2B-3DDC84?logo=android&logoColor=white" alt="Android 7+" /></a>
@@ -94,6 +94,11 @@ adb shell settings put secure enabled_accessibility_services \
 adb shell settings put secure accessibility_enabled 1
 ```
 
+Then open NeuralBridge and turn the **master switch ON**. The MCP server runs in a
+foreground service with a persistent notification. For fast screenshots, open
+**Setup → MediaProjection → GRANT** once (the consent is single-use and must be
+re-granted after the app process is killed or the device reboots).
+
 > [!IMPORTANT]
 > **Android 15+** requires an extra step: Settings → Apps → NeuralBridge → Enable **"Allow restricted settings"**
 
@@ -125,6 +130,43 @@ claude mcp add neuralbridge http://<device-ip>:7474/mcp --transport http
 ### 4️⃣ Verify
 
 Ask your AI agent: *"Take a screenshot of the Android device"* — if you see a screenshot, you're connected! 🎉
+
+---
+
+## 🔁 Background operation & self-healing
+
+Since **0.7.0** the MCP server lives in its own foreground service
+(`McpForegroundService`) instead of inside the AccessibilityService:
+
+- **Persistent notification** with **Stop** / **Restart** actions. It contains
+  only the listening URL and an error message — never input text, tokens or
+  account data.
+- **`START_STICKY` + BootReceiver**: with the master switch ON, the server comes
+  back after a low-memory kill, a reboot (`BOOT_COMPLETED`) or an app update
+  (`MY_PACKAGE_REPLACED`).
+- **Watchdog**: verifies the listener every 20 s, restarts with bounded
+  exponential backoff, and pauses after 5 consecutive failures (tap **Restart**).
+- **Port conflicts** (`7474 already in use`) are reported in the notification and
+  on the Status tab instead of crashing; the watchdog retries after the port is
+  released.
+- **Accessibility is independent**: disabling the accessibility service, or a
+  crash/rebind, does not stop the MCP server. Accessibility-dependent tools
+  return `ACCESSIBILITY_NOT_CONNECTED` until it reconnects.
+- **Force-stop is not self-healed**: Android deliberately refuses to restart a
+  force-stopped app. Open NeuralBridge once and the server starts immediately.
+- **MediaProjection** consent is granted explicitly from the Setup tab. It is
+  single-use and resets when the process dies or the device reboots.
+
+### Huawei / HarmonyOS
+
+An OEM background manager can still stop the app even with a foreground service.
+For reliable long-running automation set **Settings → Battery → App launch →
+NeuralBridge → Manage manually** and enable **Auto-launch**, **Secondary
+launch**, and **Run in background**. Also allow NeuralBridge to ignore battery
+optimizations (the Setup tab counts this as one of its four permissions).
+
+These OEM settings complement the foreground service — they do not replace it.
+The watchdog still reports failures if the OS prevents a restart.
 
 ---
 

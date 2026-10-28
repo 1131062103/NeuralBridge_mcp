@@ -14,6 +14,10 @@ import io.ktor.server.routing.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
+import java.io.IOException
+import java.net.BindException
+import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
@@ -27,7 +31,7 @@ class McpHttpServer(
         const val MCP_PORT = 7474
         private const val TAG = "McpHttpServer"
         private const val SERVER_NAME = "neuralbridge-android"
-        private const val SERVER_VERSION = "0.6.0"
+        private const val SERVER_VERSION = "0.7.0"
         private const val PROTOCOL_VERSION = "2024-11-05"
         private const val SCREEN_WAKE_LOCK_TIMEOUT_MS = 5L * 60 * 1000 // 5 minutes
     }
@@ -53,7 +57,7 @@ class McpHttpServer(
         isLenient = true
     }
 
-    suspend fun start() = withContext(Dispatchers.IO) {
+    suspend fun start() {
         releaseScreenWakeLock()
         @Suppress("DEPRECATION")
         val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -65,7 +69,12 @@ class McpHttpServer(
         val wifiIp = McpNetworkUtils.getWifiIpAddress(context)
         Log.i(TAG, "Starting MCP HTTP server on 0.0.0.0:$port (WiFi: $wifiIp)")
 
-        server = embeddedServer(CIO, port = port, host = "0.0.0.0") {
+        // Ktor CIO reports bind failures from its own accept coroutine, which
+        // would crash the process if we let it try a busy port. Probe first so
+        // the controller gets a normal BindException it can report and retry.
+        ensurePortAvailable()
+
+        val engine = embeddedServer(CIO, port = port, host = "0.0.0.0") {
             routing {
                 get("/") {
                     call.respondText("NeuralBridge MCP Server v$SERVER_VERSION — POST /mcp")
@@ -103,9 +112,38 @@ class McpHttpServer(
                 }
             }
 
-        }.start(wait = false)
+        }
+
+        try {
+            engine.start(wait = false)
+            // Wait for the socket to be bound so a port conflict surfaces here
+            // (and is reported by McpServerController) instead of being logged
+            // asynchronously by Ktor.
+            engine.engine.resolvedConnectors()
+            server = engine
+        } catch (e: Exception) {
+            runCatching { engine.stop(gracePeriodMillis = 100, timeoutMillis = 1_000) }
+                .onFailure { Log.w(TAG, "Failed to stop HTTP engine after bind failure", it) }
+            throw e
+        }
 
         Log.i(TAG, "MCP HTTP server started. URL: http://${wifiIp ?: "device-ip"}:$port/mcp")
+    }
+
+    /**
+     * Bind and immediately release the port to confirm it is free. The race
+     * window until Ktor binds is tiny and far safer than letting Ktor's
+     * asynchronous accept job throw an uncaught BindException.
+     */
+    private fun ensurePortAvailable() {
+        try {
+            ServerSocket().use { socket ->
+                socket.reuseAddress = true
+                socket.bind(InetSocketAddress("0.0.0.0", port), 1)
+            }
+        } catch (e: IOException) {
+            throw BindException("Address already in use: port $port").apply { initCause(e) }
+        }
     }
 
     private suspend fun handleMcpPost(call: ApplicationCall) {

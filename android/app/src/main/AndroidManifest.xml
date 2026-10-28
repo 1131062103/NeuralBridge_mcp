@@ -8,11 +8,14 @@
     <!-- Keep screen on while MCP client is connected -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <!-- Foreground service for keeping AccessibilityService alive -->
+    <!-- Foreground service that owns the MCP HTTP server -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Restart the MCP service after reboot or app update -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Notification listener for full notification content -->
     <uses-permission android:name="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
@@ -63,22 +66,43 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:taskAffinity="" />
 
-        <!-- AccessibilityService - Core automation service -->
+        <!-- AccessibilityService - UI observation and gesture injection only.
+             This is no longer a foreground service: the MCP foreground service
+             keeps the process alive, so an accessibility crash/disconnect does
+             not take port 7474 down with it. -->
         <service
             android:name=".service.NeuralBridgeAccessibilityService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true"
-            android:foregroundServiceType="specialUse|mediaProjection">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
             </intent-filter>
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- MCP foreground service - owns the HTTP server and self-heals -->
+        <service
+            android:name=".service.McpForegroundService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse|mediaProjection">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="AI-powered Android automation for development and testing" />
+                android:value="MCP server for on-device UI automation" />
         </service>
+
+        <!-- Restart the MCP service after reboot or app update when enabled -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <!-- NotificationListenerService - For full notification content -->
         <service

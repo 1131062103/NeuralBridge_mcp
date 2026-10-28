@@ -19,8 +19,6 @@ import android.view.WindowManager
 import androidx.annotation.RequiresApi
 import com.neuralbridge.companion.service.ScreenshotQuality
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -46,8 +44,7 @@ import kotlin.coroutines.resumeWithException
  * app restart or device reboot.
  */
 class ScreenshotPipeline(
-    private val accessibilityService: AccessibilityService,
-    private val scope: CoroutineScope
+    private val accessibilityService: AccessibilityService
 ) {
     companion object {
         private const val TAG = "ScreenshotPipeline"
@@ -68,10 +65,23 @@ class ScreenshotPipeline(
     // Listener notified when MediaProjection session dies
     var onMediaProjectionLost: (() -> Unit)? = null
 
+    /**
+     * Invoked immediately before getMediaProjection(). The host app must be
+     * running a foreground service whose type includes
+     * FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION, otherwise Android 12+ rejects
+     * the projection ("Media projections require a foreground service of type
+     * ..."). Wired to McpForegroundService by the accessibility service.
+     */
+    var ensureProjectionForeground: (() -> Unit)? = null
+
+    /** Invoked when the projection session ends; drops the projection FGS type. */
+    var onProjectionEnded: (() -> Unit)? = null
+
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
             Log.w(TAG, "MediaProjection session stopped by system")
             releaseProjectionResources()
+            onProjectionEnded?.invoke()
             onMediaProjectionLost?.invoke()
         }
     }
@@ -107,8 +117,7 @@ class ScreenshotPipeline(
      * Consume a pending consent result without launching the consent activity.
      *
      * Used by tryConsumeMediaProjectionConsent() after MainActivity.onResume() to avoid
-     * re-launching ScreenshotConsentActivity when the service's polling loop already
-     * stored the result but hasn't consumed it yet.
+     * re-launching ScreenshotConsentActivity after the Setup tab already granted it.
      *
      * @return true if a pending result was consumed and MediaProjection was created
      */
@@ -118,6 +127,9 @@ class ScreenshotPipeline(
         val (resultCode, resultData) = result
         if (resultCode != Activity.RESULT_OK || resultData == null) return false
         return try {
+            // Android 12+: the app must already be running a foreground service
+            // with the mediaProjection type before the projection is created.
+            ensureProjectionForeground?.invoke()
             val manager = accessibilityService.getSystemService(MediaProjectionManager::class.java)
             val projection = manager.getMediaProjection(resultCode, resultData)
             registerCallback(projection)
@@ -131,29 +143,13 @@ class ScreenshotPipeline(
     }
 
     /**
-     * Request MediaProjection permission (launches consent dialog)
-     *
-     * This should be called on app startup to pre-request permission.
-     * @return true if permission was granted, false if denied
-     */
-    suspend fun requestMediaProjectionPermission(): Boolean {
-        return try {
-            val projection = initializeMediaProjection()
-            registerCallback(projection)
-            mediaProjection = projection
-            Log.i(TAG, "MediaProjection permission granted")
-            true
-        } catch (e: Exception) {
-            Log.w(TAG, "MediaProjection permission denied: ${e.message}")
-            false
-        }
-    }
-
-    /**
      * Register MediaProjection.Callback for session death detection.
      * On Android 14+ (API 34), this is MANDATORY before createVirtualDisplay().
      */
     private fun registerCallback(projection: MediaProjection) {
+        // The same projection can be returned when a consent result was already
+        // consumed by tryConsumePendingConsent(); do not register twice.
+        if (projection === mediaProjection) return
         projection.registerCallback(projectionCallback, Handler(Looper.getMainLooper()))
     }
 
@@ -168,6 +164,12 @@ class ScreenshotPipeline(
             val startTime = System.currentTimeMillis()
 
             try {
+                // If the user granted consent after the request coroutine timed
+                // out (or from the Setup tab), pick the grant up lazily.
+                if (mediaProjection == null && ScreenshotConsentActivity.hasConsentResult()) {
+                    tryConsumePendingConsent()
+                }
+
                 // Try MediaProjection path first
                 val bitmap = captureViaMediaProjection()
 
@@ -232,37 +234,33 @@ class ScreenshotPipeline(
         val reader = imageReader
             ?: throw IllegalStateException("ImageReader is null after createVirtualDisplay")
 
-        // Step 3: Wait for next image from ImageReader (with timeout to prevent deadlock)
-        val image = try { withTimeout(IMAGE_READER_TIMEOUT_MS) {
-            suspendCancellableCoroutine<android.media.Image> { continuation ->
-                // Use local reader reference — safe from concurrent nullification by projectionCallback
+        // Step 3: Take the latest frame. A static screen does not produce new
+        // frames, so prefer the already-buffered image instead of draining it
+        // and waiting for an update (which could take seconds or time out).
+        val image = try {
+            reader.acquireLatestImage() ?: withTimeout(IMAGE_READER_TIMEOUT_MS) {
+                suspendCancellableCoroutine<android.media.Image> { continuation ->
+                    // Use local reader reference — safe from concurrent nullification by projectionCallback
+                    reader.setOnImageAvailableListener({ ir ->
+                        // Remove listener FIRST — prevents double-fire if a second frame arrives
+                        // before the coroutine resumes and unregisters it
+                        ir.setOnImageAvailableListener(null, null)
+                        val img = ir.acquireLatestImage()
+                        if (img != null) {
+                            continuation.resume(img)
+                        } else {
+                            continuation.resumeWithException(
+                                IllegalStateException("acquireLatestImage returned null")
+                            )
+                        }
+                    }, Handler(Looper.getMainLooper()))
 
-                // Drain stale images from previous capture to prevent buffer overflow
-                var stale = reader.acquireLatestImage()
-                while (stale != null) {
-                    stale.close()
-                    stale = reader.acquireLatestImage()
-                }
-
-                reader.setOnImageAvailableListener({ ir ->
-                    // Remove listener FIRST — prevents double-fire if a second frame arrives
-                    // before the coroutine resumes and unregisters it
-                    ir.setOnImageAvailableListener(null, null)
-                    val img = ir.acquireLatestImage()
-                    if (img != null) {
-                        continuation.resume(img)
-                    } else {
-                        continuation.resumeWithException(
-                            IllegalStateException("acquireLatestImage returned null")
-                        )
+                    continuation.invokeOnCancellation {
+                        reader.setOnImageAvailableListener(null, null)
                     }
-                }, Handler(Looper.getMainLooper()))
-
-                continuation.invokeOnCancellation {
-                    reader.setOnImageAvailableListener(null, null)
                 }
             }
-        } } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
             // Tear down stale VirtualDisplay/ImageReader so next capture recreates them fresh
             Log.w(TAG, "ImageReader timed out after ${IMAGE_READER_TIMEOUT_MS}ms — tearing down pipeline")
             virtualDisplay?.release()
@@ -369,76 +367,6 @@ class ScreenshotPipeline(
             val cropped = Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
             bitmap.recycle()
             cropped
-        }
-    }
-
-    /**
-     * Initialize MediaProjection (requires user consent)
-     */
-    private suspend fun initializeMediaProjection(): MediaProjection = withContext(Dispatchers.Main) {
-        suspendCancellableCoroutine { continuation ->
-            Log.d(TAG, "Initializing MediaProjection (requires user consent)")
-
-            // Step 1: Launch ScreenshotConsentActivity to get user consent
-            val intent = ScreenshotConsentActivity.createIntent(accessibilityService)
-            accessibilityService.startActivity(intent)
-
-            // Step 2: Poll for consent result (since we can't directly await Activity result from Service)
-            val pollJob = scope.launch(Dispatchers.IO) {
-                var attempts = 0
-                val maxAttempts = 100 // 10 seconds timeout (100 * 100ms)
-
-                while (attempts < maxAttempts) {
-                    if (ScreenshotConsentActivity.hasConsentResult()) {
-                        val result = ScreenshotConsentActivity.consumeConsentResult()
-
-                        if (result != null) {
-                            val (resultCode, resultData) = result
-
-                            if (resultCode == Activity.RESULT_OK && resultData != null) {
-                                try {
-                                    // Step 3: Create MediaProjection from consent result
-                                    val mediaProjectionManager = accessibilityService.getSystemService(
-                                        MediaProjectionManager::class.java
-                                    )
-                                    val projection = mediaProjectionManager.getMediaProjection(resultCode, resultData)
-
-                                    Log.i(TAG, "MediaProjection initialized successfully")
-                                    continuation.resume(projection)
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Failed to create MediaProjection", e)
-                                    continuation.resumeWithException(e)
-                                }
-                            } else {
-                                val error = Exception("MediaProjection consent denied by user")
-                                Log.w(TAG, error.message.orEmpty())
-                                continuation.resumeWithException(error)
-                            }
-                        } else {
-                            val error = Exception("MediaProjection consent result is null")
-                            Log.e(TAG, error.message.orEmpty())
-                            continuation.resumeWithException(error)
-                        }
-
-                        return@launch
-                    }
-
-                    // Wait 100ms before checking again
-                    kotlinx.coroutines.delay(100)
-                    attempts++
-                }
-
-                // Timeout
-                val error = Exception("MediaProjection consent timeout (user did not respond)")
-                Log.e(TAG, error.message.orEmpty())
-                continuation.resumeWithException(error)
-            }
-
-            // Cancel polling if the coroutine is cancelled
-            continuation.invokeOnCancellation {
-                Log.d(TAG, "MediaProjection initialization cancelled")
-                pollJob.cancel()
-            }
         }
     }
 
@@ -555,8 +483,13 @@ class ScreenshotPipeline(
         imageReader?.close()
         imageReader = null
 
+        val hadProjection = mediaProjection != null
         mediaProjection?.stop()
         mediaProjection = null
+
+        if (hadProjection) {
+            onProjectionEnded?.invoke()
+        }
 
         Log.d(TAG, "Screenshot pipeline cleaned up")
     }

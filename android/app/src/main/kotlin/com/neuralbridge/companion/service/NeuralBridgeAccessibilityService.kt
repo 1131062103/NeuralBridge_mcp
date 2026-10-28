@@ -2,25 +2,15 @@ package com.neuralbridge.companion.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
-import android.os.Build
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import androidx.core.app.NotificationCompat
-import com.neuralbridge.companion.R
+import com.neuralbridge.companion.AppPrefs
 import com.neuralbridge.companion.gesture.GestureEngine
 import com.neuralbridge.companion.input.InputEngine
 import com.neuralbridge.companion.uitree.UiTreeWalker
 import com.neuralbridge.companion.screenshot.ScreenshotPipeline
-import com.neuralbridge.companion.mcp.McpHttpServer
-import com.neuralbridge.companion.mcp.McpToolHandler
 import kotlinx.coroutines.*
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -34,15 +24,15 @@ import java.util.concurrent.atomic.AtomicLong
  * - Screenshot capture
  * - Event streaming to connected clients
  *
- * The service runs as a foreground service with persistent notification
- * to prevent Android from killing it during automation sessions.
+ * The MCP HTTP server lives in its own foreground service
+ * (McpForegroundService), so this service can be unbound or marked crashed
+ * without taking port 7474 down. Tools that need accessibility read
+ * [services] per call and return ACCESSIBILITY_NOT_CONNECTED when it is null.
  */
 class NeuralBridgeAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "NeuralBridge"
-        private const val NOTIFICATION_CHANNEL_ID = "neuralbridge_service"
-        private const val NOTIFICATION_ID = 1
 
         // Event streaming throttling: max 10 events/sec = 1 event per 100ms
         private const val MIN_EVENT_INTERVAL_MS = 100L
@@ -53,6 +43,15 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
          */
         @Volatile
         var instance: NeuralBridgeAccessibilityService? = null
+            private set
+
+        /**
+         * Accessible bundle (service + engines) for MCP tool calls. Set on
+         * connect, cleared on unbind/destroy. Null means "accessibility not
+         * connected" — callers must not crash.
+         */
+        @Volatile
+        var services: CompanionServices? = null
             private set
 
         /**
@@ -70,9 +69,6 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
     private lateinit var inputEngine: InputEngine
     private lateinit var uiTreeWalker: UiTreeWalker
     private lateinit var screenshotPipeline: ScreenshotPipeline
-
-    // MCP HTTP server
-    private var mcpHttpServer: McpHttpServer? = null
 
     // Event listener for UI changes (CopyOnWriteArrayList for thread-safe iteration from onAccessibilityEvent)
     private val eventListeners = java.util.concurrent.CopyOnWriteArrayList<AccessibilityEventListener>()
@@ -101,12 +97,23 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
 
         // Publish instance before conditional startup so MainActivity can query it
         instance = this
+        services = CompanionServices(
+            service = this,
+            gestureEngine = gestureEngine,
+            uiTreeWalker = uiTreeWalker,
+            inputEngine = inputEngine,
+            screenshotPipeline = screenshotPipeline
+        )
 
-        // Only start foreground service, HTTP server, and screen recording if toggle is on
-        if (isEnabled()) {
-            startForegroundService()
-            startMcpHttpServer()
-            requestMediaProjectionPermission()
+        // The MCP server has its own foreground service. ensureRunning() is a
+        // no-op when it is already listening, so accessibility reconnects never
+        // create a second server or race for port 7474.
+        //
+        // MediaProjection consent is requested explicitly from the Setup tab,
+        // never here: this callback also fires after a crash/reboot and a system
+        // dialog would otherwise interrupt whatever automation is in progress.
+        if (AppPrefs.isEnabled(this)) {
+            McpForegroundService.ensureRunning(this)
         }
 
         Log.i(TAG, "NeuralBridge service fully initialized")
@@ -129,102 +136,32 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
         gestureEngine = GestureEngine(this)
         inputEngine = InputEngine(this)
         uiTreeWalker = UiTreeWalker(this)
-        screenshotPipeline = ScreenshotPipeline(this, serviceScope)
+        screenshotPipeline = ScreenshotPipeline(this)
 
-        // Update notification when MediaProjection session is lost by the system
+        // Update state when the MediaProjection session is lost by the system
         screenshotPipeline.onMediaProjectionLost = {
             Log.w(TAG, "MediaProjection session lost - falling back to AccessibilityService screenshots")
-            updateNotificationForSlowScreenshots()
+        }
+
+        // MediaProjection requires the hosting app to be running a foreground
+        // service with FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION. The MCP
+        // foreground service carries that type; ask it before and after the
+        // projection session.
+        screenshotPipeline.ensureProjectionForeground = {
+            McpForegroundService.updateProjectionForegroundType(includeProjection = true)
+        }
+        screenshotPipeline.onProjectionEnded = {
+            McpForegroundService.updateProjectionForegroundType(includeProjection = false)
         }
 
         Log.d(TAG, "Core components initialized")
     }
 
     /**
-     * Start MCP HTTP server (JSON-RPC over HTTP, port 7474)
-     */
-    private fun startMcpHttpServer() {
-        val toolHandler = McpToolHandler(
-            service = this,
-            gestureEngine = gestureEngine,
-            uiTreeWalker = uiTreeWalker,
-            inputEngine = inputEngine,
-            screenshotPipeline = screenshotPipeline
-        )
-        val server = McpHttpServer(
-            context = this,
-            toolHandler = toolHandler
-        )
-        mcpHttpServer = server
-        serviceScope.launch {
-            try {
-                server.start()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start MCP HTTP server", e)
-            }
-        }
-    }
-
-    /**
-     * Start service as foreground service
-     */
-    private fun startForegroundService() {
-        createNotificationChannel()
-
-        val notification = buildNotification(
-            title = getString(R.string.foreground_service_title),
-            message = getString(R.string.foreground_service_message)
-        )
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // Android 14+: must specify foreground service type matching manifest declaration
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
-
-        Log.d(TAG, "Foreground service started")
-    }
-
-    /**
-     * Request MediaProjection permission for fast screenshot capture
-     *
-     * This is called on service startup to pre-request permission so that
-     * screenshots use the fast path (60ms) instead of AccessibilityService fallback (~200-400ms).
-     *
-     * On Android 14+, this permission is single-use and expires when the
-     * app process is killed or device restarts.
-     */
-    private fun requestMediaProjectionPermission() {
-        // Check if already granted
-        if (screenshotPipeline.hasMediaProjectionPermission()) {
-            Log.i(TAG, "MediaProjection permission already granted")
-            return
-        }
-
-        // Request permission asynchronously
-        serviceScope.launch {
-            delay(1000) // Wait 1 second after service startup before showing dialog
-
-            val granted = screenshotPipeline.requestMediaProjectionPermission()
-
-            if (granted) {
-                Log.i(TAG, "MediaProjection permission granted - fast screenshots enabled")
-                updateNotificationForFastScreenshots()
-            } else {
-                Log.w(TAG, "MediaProjection permission denied - will use AccessibilityService.takeScreenshot() fallback on API 30+")
-            }
-        }
-    }
-
-    /**
-     * Try to consume any pending MediaProjection consent result.
-     * Called from MainActivity.onResume() after user grants consent via Setup tab.
-     *
-     * Deliberately calls tryConsumePendingConsent() rather than requestMediaProjectionPermission()
-     * to avoid re-launching ScreenshotConsentActivity. When onResume() fires after the user
-     * accepts the auto-prompted dialog, the service's polling loop may not have consumed the
-     * result yet — calling requestMediaProjectionPermission() would show the popup a second time.
+     * Try to consume any pending MediaProjection consent result. Called from
+     * MainActivity.onResume() after the user grants consent in the Setup tab.
+     * It only consumes the stored result; it never launches a new consent
+     * dialog.
      */
     fun tryConsumeMediaProjectionConsent() {
         if (screenshotPipeline.hasMediaProjectionPermission()) return
@@ -233,75 +170,8 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
             val granted = screenshotPipeline.tryConsumePendingConsent()
             if (granted) {
                 Log.i(TAG, "MediaProjection permission granted from UI - fast screenshots enabled")
-                updateNotificationForFastScreenshots()
             }
         }
-    }
-
-    /**
-     * Update notification when MediaProjection is lost (user can tap to re-enable)
-     */
-    private fun updateNotificationForSlowScreenshots() {
-        val notification = buildNotification(
-            title = getString(R.string.foreground_service_title),
-            message = "Fast screenshots disabled \u2014 tap to re-enable"
-        )
-
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.notify(NOTIFICATION_ID, notification)
-    }
-
-    /**
-     * Update notification to indicate fast screenshots are enabled
-     */
-    private fun updateNotificationForFastScreenshots() {
-        val notification = buildNotification(
-            title = getString(R.string.foreground_service_title),
-            message = "Fast screenshots enabled (60ms)"
-        )
-
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.notify(NOTIFICATION_ID, notification)
-    }
-
-    /**
-     * Create notification channel (Android 8.0+)
-     */
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                "NeuralBridge Service",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Keeps NeuralBridge service running"
-                setShowBadge(false)
-            }
-
-            val notificationManager = getSystemService(NotificationManager::class.java)
-            notificationManager.createNotificationChannel(channel)
-        }
-    }
-
-    /**
-     * Build notification for foreground service
-     */
-    private fun buildNotification(title: String, message: String): Notification {
-        val openAppIntent = Intent(this, com.neuralbridge.companion.MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0, openAppIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(message)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setContentIntent(pendingIntent)
-            .build()
     }
 
     /**
@@ -351,35 +221,40 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Service unbound. The MCP foreground service and HTTP server keep running;
+     * only accessibility-related state is cleared.
+     */
+    override fun onUnbind(intent: Intent?): Boolean {
+        Log.i(TAG, "AccessibilityService unbound")
+        cleanupAccessibilityState()
+        return super.onUnbind(intent)
+    }
+
+    /**
      * Service destroyed
      */
     override fun onDestroy() {
-        Log.i(TAG, "Service shutting down")
+        Log.i(TAG, "Accessibility service shutting down")
+        cleanupAccessibilityState()
+        serviceScope.cancel()
+        super.onDestroy()
+    }
 
-        // Release screen wake lock synchronously before scope cancellation
-        mcpHttpServer?.releaseScreenWakeLock()
-
-        // Clean up screenshot pipeline synchronously (releases VirtualDisplay, ImageReader, MediaProjection)
+    /**
+     * Release accessibility-only resources. Deliberately does NOT touch the
+     * MCP foreground service: an accessibility crash must not drop port 7474.
+     */
+    private fun cleanupAccessibilityState() {
+        // Releases VirtualDisplay, ImageReader and MediaProjection synchronously.
         if (::screenshotPipeline.isInitialized) {
             screenshotPipeline.cleanup()
         }
-
-        // Stop MCP HTTP server synchronously to release port 7474
-        runBlocking(Dispatchers.IO) {
-            try {
-                mcpHttpServer?.stop()
-            } catch (e: Exception) {
-                Log.e(TAG, "Error stopping MCP HTTP server", e)
-            }
+        if (services?.service === this) {
+            services = null
         }
-
-        // Cancel all coroutines
-        serviceScope.cancel()
-
-        // Clear static instance
-        instance = null
-
-        super.onDestroy()
+        if (instance === this) {
+            instance = null
+        }
     }
 
     // ========================================================================
@@ -455,37 +330,14 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Check if the user has enabled NeuralBridge via the master toggle
-     */
-    private fun isEnabled(): Boolean {
-        return getSharedPreferences("neuralbridge_prefs", Context.MODE_PRIVATE)
-            .getBoolean("nb_enabled", false)
-    }
-
-    /**
-     * Start MCP server and request MediaProjection — called when user turns on the master toggle
-     */
-    fun enable() {
-        startForegroundService()
-        startMcpHttpServer()
-        requestMediaProjectionPermission()
-    }
-
-    /**
-     * Stop MCP server and remove notification — called when user turns off the master toggle
+     * Called when the user turns off the master toggle. Releases the
+     * MediaProjection session; the MCP foreground service is stopped by
+     * MainActivity so the two controls cannot drift apart.
      */
     fun disable() {
-        // Clean up screenshot pipeline synchronously (releases VirtualDisplay, ImageReader, MediaProjection)
+        // Releases VirtualDisplay, ImageReader and MediaProjection synchronously.
         if (::screenshotPipeline.isInitialized) {
             screenshotPipeline.cleanup()
-        }
-
-        @Suppress("DEPRECATION")
-        stopForeground(true)
-        mcpHttpServer?.releaseScreenWakeLock()
-        serviceScope.launch {
-            mcpHttpServer?.stop()
-            mcpHttpServer = null
         }
     }
 
@@ -498,11 +350,10 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Check if an MCP HTTP client has been active recently (within 30s window)
+     * Check if an MCP HTTP client has been active recently (within 30s window).
+     * The server is owned by McpServerController, not by this service.
      */
-    fun isHttpClientActive(): Boolean {
-        return mcpHttpServer?.isClientActive() ?: false
-    }
+    fun isHttpClientActive(): Boolean = McpServerController.isClientActive()
 
     /**
      * Get service uptime in milliseconds
@@ -514,12 +365,12 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
     /**
      * Get MCP HTTP server port (for MainActivity display)
      */
-    fun getMcpHttpPort(): Int = mcpHttpServer?.getPort() ?: McpHttpServer.MCP_PORT
+    fun getMcpHttpPort(): Int = McpServerController.port()
 
     /**
      * Check if MCP HTTP server is running (for MainActivity status display)
      */
-    fun getMcpHttpActive(): Boolean = mcpHttpServer?.isRunning() ?: false
+    fun getMcpHttpActive(): Boolean = McpServerController.isRunning
 
     /**
      * Check if MediaProjection permission is granted

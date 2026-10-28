@@ -31,16 +31,16 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.neuralbridge.companion.adapter.LogAdapter
 import com.neuralbridge.companion.log.CommandLog
-import com.neuralbridge.companion.mcp.McpHttpServer
 import com.neuralbridge.companion.mcp.McpNetworkUtils
+import com.neuralbridge.companion.service.McpForegroundService
+import com.neuralbridge.companion.service.McpServerController
+import com.neuralbridge.companion.service.McpServerState
 import com.neuralbridge.companion.service.NeuralBridgeAccessibilityService
 
 class MainActivity : Activity() {
 
     companion object {
         private const val REQUEST_CODE_POST_NOTIFICATIONS = 1001
-        private const val PREFS_NAME = "neuralbridge_prefs"
-        private const val KEY_ENABLED = "nb_enabled"
     }
 
     // Tab views
@@ -93,6 +93,7 @@ class MainActivity : Activity() {
         override fun run() {
             updateServiceStatus()
             updatePerformanceStats()
+            updateAllPermissionStatus()
             if (!logsPaused) updateLogEntries()
             statusHandler.postDelayed(this, 1000)
         }
@@ -116,6 +117,11 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // Opening the app is also the recovery path after am force-stop (which
+        // Android never auto-restarts) and after a boot-receiver denial.
+        if (AppPrefs.isEnabled(this)) {
+            McpForegroundService.ensureRunning(this)
+        }
         NeuralBridgeAccessibilityService.instance?.tryConsumeMediaProjectionConsent()
         updateAllPermissionStatus()
         statusHandler.post(statusRunnable)
@@ -215,16 +221,18 @@ class MainActivity : Activity() {
     // ========================================================================
 
     private fun setupMasterToggle() {
-        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        val enabled = prefs.getBoolean(KEY_ENABLED, false)
-        masterToggle.isChecked = enabled
+        masterToggle.isChecked = AppPrefs.isEnabled(this)
 
         masterToggle.setOnCheckedChangeListener { _, isChecked ->
-            prefs.edit().putBoolean(KEY_ENABLED, isChecked).apply()
+            AppPrefs.setEnabled(this, isChecked)
             if (isChecked) {
                 requestNotificationPermissionIfNeeded()
-                NeuralBridgeAccessibilityService.instance?.enable()
+                // The MCP server now lives in its own foreground service.
+                // MediaProjection consent is a separate, explicit Setup action.
+                McpForegroundService.ensureRunning(this)
             } else {
+                // Must really stop: server, notification and port 7474.
+                McpForegroundService.stop(this)
                 NeuralBridgeAccessibilityService.instance?.disable()
             }
             updateServiceStatus()
@@ -239,51 +247,91 @@ class MainActivity : Activity() {
     private fun updateServiceStatus() {
         val enabled = masterToggle.isChecked
         val service = NeuralBridgeAccessibilityService.instance
-        val isRunning = service != null
-        val httpActive = if (enabled) service?.isHttpClientActive() ?: false else false
+        val accessibilityOn = isAccessibilityServiceEnabled()
+
+        // Server state comes from the controller, so the status page is correct
+        // even while the accessibility service is disconnected.
+        val serverState = McpServerController.state.value
+        val serverRunning = serverState is McpServerState.Running
+        val serverFailed = serverState is McpServerState.Failed
+        val httpActive = enabled && McpServerController.isClientActive()
 
         // Header
-        if (!enabled) {
-            statusDot.setBackgroundColor(getColor(R.color.status_inactive))
-            overallStatusText.text = "DISABLED"
-        } else if (isRunning && isAccessibilityServiceEnabled()) {
-            statusDot.setBackgroundResource(R.drawable.bg_status_dot)
-            overallStatusText.text = if (httpActive) "ALL SYSTEMS READY" else "WAITING FOR CONNECTION"
-        } else {
-            statusDot.setBackgroundColor(getColor(R.color.status_error))
-            overallStatusText.text = "SETUP INCOMPLETE"
+        when {
+            !enabled -> {
+                statusDot.setBackgroundColor(getColor(R.color.status_inactive))
+                overallStatusText.text = "DISABLED"
+            }
+            !accessibilityOn -> {
+                statusDot.setBackgroundColor(getColor(R.color.status_error))
+                overallStatusText.text = "SETUP INCOMPLETE"
+            }
+            serverFailed -> {
+                statusDot.setBackgroundColor(getColor(R.color.status_error))
+                overallStatusText.text = "MCP SERVER ERROR"
+            }
+            serverRunning -> {
+                statusDot.setBackgroundResource(R.drawable.bg_status_dot)
+                overallStatusText.text =
+                    if (httpActive) "ALL SYSTEMS READY" else "WAITING FOR CONNECTION"
+            }
+            else -> {
+                statusDot.setBackgroundResource(R.drawable.bg_status_dot)
+                overallStatusText.text = "STARTING MCP SERVER"
+            }
         }
 
         // Connection hero card
-        val httpPort = service?.getMcpHttpPort() ?: McpHttpServer.MCP_PORT
+        val httpPort = McpServerController.port()
         val wifiIp = McpNetworkUtils.getWifiIpAddress(this) ?: "device-ip"
-        if (!enabled) {
-            connectionStatusIcon.text = "⬡"
-            connectionStatusText.text = "NEURALBRIDGE IS OFF"
-            connectionStatusText.setTextColor(getColor(R.color.text_medium_emphasis))
-            connectionDetailText.text = "Toggle to enable"
-        } else if (httpActive) {
-            connectionStatusIcon.text = "📡"
-            connectionStatusText.text = "CONNECTED"
-            connectionStatusText.setTextColor(getColor(R.color.success))
-            connectionDetailText.text = "MCP: http://$wifiIp:$httpPort/mcp"
-        } else {
-            connectionStatusIcon.text = "📡"
-            connectionStatusText.text = "WAITING FOR CONNECTION"
-            connectionStatusText.setTextColor(getColor(R.color.text_medium_emphasis))
-            connectionDetailText.text = "MCP: http://$wifiIp:$httpPort/mcp"
+        when {
+            !enabled -> {
+                connectionStatusIcon.text = "⬡"
+                connectionStatusText.text = "NEURALBRIDGE IS OFF"
+                connectionStatusText.setTextColor(getColor(R.color.text_medium_emphasis))
+                connectionDetailText.text = "Toggle to enable"
+            }
+            serverFailed -> {
+                connectionStatusIcon.text = "⚠"
+                connectionStatusText.text = "MCP SERVER ERROR"
+                connectionStatusText.setTextColor(getColor(R.color.status_error))
+                connectionDetailText.text = (serverState as McpServerState.Failed).message
+            }
+            httpActive -> {
+                connectionStatusIcon.text = "📡"
+                connectionStatusText.text = "CONNECTED"
+                connectionStatusText.setTextColor(getColor(R.color.success))
+                connectionDetailText.text = "MCP: http://$wifiIp:$httpPort/mcp"
+            }
+            else -> {
+                connectionStatusIcon.text = "📡"
+                connectionStatusText.text = "WAITING FOR CONNECTION"
+                connectionStatusText.setTextColor(getColor(R.color.text_medium_emphasis))
+                connectionDetailText.text = "MCP: http://$wifiIp:$httpPort/mcp"
+            }
         }
 
         // 3-up status grid
-        val accessibilityOn = isAccessibilityServiceEnabled()
         accessibilityStatusBar.setBackgroundColor(getColor(if (accessibilityOn) R.color.status_active else R.color.status_inactive))
         accessibilityStatusTextView.text = if (accessibilityOn) "ACTIVE" else "OFF"
         accessibilityStatusTextView.setTextColor(getColor(if (accessibilityOn) R.color.success else R.color.status_error))
 
-        val mcpServerRunning = service?.getMcpHttpActive() ?: false
-        mcpStatusBar.setBackgroundColor(getColor(if (mcpServerRunning) R.color.status_active else R.color.status_inactive))
-        mcpStatusText.text = if (mcpServerRunning) "RUNNING" else "OFF"
-        mcpStatusText.setTextColor(getColor(if (mcpServerRunning) R.color.success else R.color.status_error))
+        mcpStatusBar.setBackgroundColor(getColor(if (serverRunning) R.color.status_active else R.color.status_inactive))
+        mcpStatusText.text = when {
+            serverRunning -> "RUNNING"
+            serverFailed -> "ERROR"
+            serverState is McpServerState.Starting -> "STARTING"
+            else -> "OFF"
+        }
+        mcpStatusText.setTextColor(
+            getColor(
+                when {
+                    serverRunning -> R.color.success
+                    serverFailed -> R.color.status_error
+                    else -> R.color.text_medium_emphasis
+                }
+            )
+        )
 
         val screenshotReady = service?.hasMediaProjectionPermission() ?: false
         screenshotStatusBar.setBackgroundColor(getColor(if (screenshotReady) R.color.status_active else R.color.status_inactive))
@@ -299,7 +347,7 @@ class MainActivity : Activity() {
             append("Screen: ${dm.widthPixels}x${dm.heightPixels} @ ${dm.densityDpi}dpi\n")
             append("Density: ${dm.density}x")
             val wifiIp3 = McpNetworkUtils.getWifiIpAddress(this@MainActivity) ?: "no wifi"
-            append("\nMCP: http://$wifiIp3:${McpHttpServer.MCP_PORT}/mcp")
+            append("\nMCP: http://$wifiIp3:${McpServerController.port()}/mcp")
         }
         deviceInfoText.text = info
     }

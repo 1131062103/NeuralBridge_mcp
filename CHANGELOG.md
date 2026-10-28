@@ -2,6 +2,79 @@
 
 All notable changes to NeuralBridge are documented here.
 
+## 0.7.0 — 2026-10-28
+
+### Added
+
+- `McpForegroundService`: a dedicated foreground service that owns the MCP HTTP
+  server. It is independent of the AccessibilityService binding, uses
+  `START_STICKY`, survives task removal, and keeps a persistent notification
+  with **Stop** / **Restart** actions.
+- `McpServerController`: single, concurrency-safe owner of the HTTP server with
+  a `StateFlow<McpServerState>` for the UI, bounded retry/backoff on start
+  failures, and a localhost TCP probe so a silently dead engine is recreated.
+- Watchdog in the foreground service: checks every 20 s, restarts with
+  exponential backoff, pauses after 5 consecutive failures and asks the user to
+  tap **Restart**.
+- `BootReceiver` for `BOOT_COMPLETED` and `MY_PACKAGE_REPLACED`: restarts the
+  MCP service when the master switch is ON, with the Android 12+
+  `ForegroundServiceStartNotAllowedException` handled by a user-visible
+  notification.
+- `ACCESSIBILITY_NOT_CONNECTED` error for accessibility-dependent tools. The MCP
+  server keeps answering (and tools such as `get_device_info`, `list_apps`,
+  `launch_app`, `get_notifications` keep working) while the accessibility
+  service is unbound.
+- Pre-bind port probe so an occupied port 7474 is reported as
+  `port 7474 already in use` instead of crashing inside Ktor's accept coroutine.
+
+### Fixed
+
+- MediaProjection on Android 12: the foreground service now carries
+  `FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION` (three-arg `startForeground` on API
+  29+) before `getMediaProjection()`, so the system consent no longer ends in
+  `Media projections require a foreground service of type ...`. The type is
+  dropped again when the projection ends.
+- Screenshots now return the already-buffered ImageReader frame instead of
+  draining it and waiting for a new display update; static screens no longer
+  stall the fast path.
+- Late MediaProjection consent results are still usable after a UI round-trip
+  (`MainActivity.onResume` / lazy consumption on capture), and the Setup tab's
+  permission counter refreshes on its own.
+
+### Changed
+
+- `NeuralBridgeAccessibilityService` no longer starts or owns the HTTP server or
+  a foreground notification. `onServiceConnected` only publishes its component
+  bundle and calls `McpForegroundService.ensureRunning()`; `onUnbind`/`onDestroy`
+  never stop the MCP service.
+- MediaProjection consent is now granted explicitly from the Setup tab. It is no
+  longer auto-requested on every accessibility reconnect or toggle, which used
+  to pop a system dialog after crash recovery and interrupt automation.
+- Android companion app `0.3.0` → `0.4.0` (versionCode 4); MCP server
+  `0.6.0` → `0.7.0`. All 34 existing tools, schemas and responses are unchanged.
+
+### Verified on device
+
+HUAWEI Mate 40 Pro (NOH-AN01), HarmonyOS 4.2.0 / Android 12 (API 31), 896×1848:
+
+- Service crash (`adb shell am crash`): process died with importance FGS; the
+  accessibility rebind started the server again in **2 s** (the system had
+  scheduled the FGS restart for 11 s; `ensureRunning()` is idempotent).
+- `am force-stop` does not auto-restart (Android semantics): port closed; opening
+  the app restored the server in **2 s**. Documented, not bypassed.
+- Reboot (`adb reboot`): with the switch ON, the server was listening again
+  after boot **without opening the app** (BOOT_COMPLETED → `START_STICKY`).
+- Port 7474 held by another process: 4 bounded attempts, no crash, notification
+  `MCP Server failed — port 7474 already in use`; the watchdog recovered in
+  **2 s** after the port was released.
+- 10 rapid switch toggles: stable PID, exactly one notification, no port
+  conflict and no crash.
+- Accessibility off/on while the server was running: server stayed up; tool
+  calls returned `ACCESSIBILITY_NOT_CONNECTED` while unbound.
+- MediaProjection granted from Setup: **PERMISSIONS 4/4**, `dumpsys
+  media_projection` shows an active `TYPE_SCREEN_CAPTURE` session, and thumbnail
+  screenshots measured **P50 22 ms / P95 26 ms** (vs the accessibility fallback).
+
 ## 0.6.0 — 2026-10-27
 
 ### Added

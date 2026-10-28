@@ -4,6 +4,15 @@
 
 # 🛠️ MCP Tools Reference (34 Tools)
 
+> **Service lifecycle (v0.7.0):** the MCP HTTP server runs in its own foreground
+> service and is independent of the AccessibilityService binding. If accessibility
+> is not connected, accessibility-dependent tools return
+> `{"success":false,"error":{"code":"ACCESSIBILITY_NOT_CONNECTED","message":"..."}}`
+> while `get_device_info`, `list_apps`, `get_notifications`, `launch_app`,
+> `open_url`, `set_clipboard`, `list_devices`, `search_tools` and
+> `describe_tools` keep working. See
+> [Background operation & self-healing](../README.md#-background-operation--self-healing).
+>
 > **Batch execution (v0.6.0):** `android_sequence` runs an ordered list of UI
 > actions in one MCP call, returning per-step results and one final UI tree.
 > See [Batch execution with `sequence`](#-sequence--batch-ui-actions-v060) below.

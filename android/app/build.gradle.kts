@@ -13,8 +13,8 @@ android {
         applicationId = "com.neuralbridge.companion"
         minSdk = 24  // Android 7.0 - required for AccessibilityService.dispatchGesture()
         targetSdk = 34
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 4
+        versionName = "0.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -74,6 +74,11 @@ android {
         getByName("main") {
             kotlin.srcDirs("src/main/kotlin")
         }
+    }
+
+    testOptions {
+        // android.util.Log etc. return defaults instead of throwing in JVM tests.
+        unitTests.isReturnDefaultValues = true
     }
 }
 
